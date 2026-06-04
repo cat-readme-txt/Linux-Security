@@ -1,0 +1,29 @@
+# authorized.txt — list of accounts allowed on this system.
+#
+# HOW TO USE:
+#   1. Copy this file to "authorized.txt" (next to harden.sh), or pass a path
+#      with --authorized /path/to/file.
+#   2. Replace the example names below with the REAL authorized accounts taken
+#      from your competition README / system documentation.
+#   3. Run:  sudo ./harden.sh   and choose the "User & Group Audit" section.
+#
+# RULES:
+#   * Lines starting with '#' are comments. Blank lines are ignored.
+#   * Inline comments after a value are allowed (everything after '#' is dropped).
+#   * Two sections, introduced exactly by [users] and [sudoers]:
+#       [users]   = EVERY human login account that is allowed to exist.
+#       [sudoers] = the subset of those users allowed admin (sudo/wheel) access.
+#   * Any human account (UID >= 1000) NOT under [users] is flagged for deletion.
+#   * Any sudo/wheel member NOT under [sudoers] is flagged for removal from that
+#     group (the account itself is kept).
+#   * The account currently running the script is never offered for deletion.
+#   * 'root' is handled automatically and does not need to be listed.
+
+[users]
+alice
+bob
+charlie
+
+[sudoers]
+alice
+bob
