@@ -211,6 +211,13 @@ revert_action() {
     USER_LOCK)
       passwd -u "$a1" >/dev/null 2>&1 && echo "  ${C_GRN}unlocked${C_RST} account $a1"
       ;;
+    USER_PWHASH)      # restore the account's original password hash
+      if usermod -p "$a2" "$a1" 2>/dev/null; then
+        echo "  ${C_GRN}restored original password${C_RST} for $a1"
+      else
+        echo "  ${C_YEL}could not restore password hash for $a1 (try the /etc/shadow backup)${C_RST}"
+      fi
+      ;;
     USER_DELETE)
       # passwd/shadow/group/gshadow are restored by their FILE_BACKUP entries;
       # here we restore the user's home directory from the archive.

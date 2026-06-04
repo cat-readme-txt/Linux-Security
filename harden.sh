@@ -30,6 +30,13 @@
 # ----------------------------------------------------------------------------
 #
 # Usage:   sudo ./harden.sh [--authorized PATH] [--state-dir DIR] [--yes-risky]
+#          sudo ./harden.sh --show-last        # replay the last run's transcript
+#
+# The full session is mirrored to <run-dir>/output.log, so even if a task ends
+# your session (e.g. a display-manager restart) you can review everything after
+# logging back in with:  sudo ./harden.sh --show-last
+# Session-disrupting actions (display-manager restart) are deferred to the very
+# end, after all other selected sections have completed.
 #
 # ============================================================================
 
@@ -42,14 +49,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AUTH_FILE="$SCRIPT_DIR/authorized.txt"
 STATE_BASE="/var/backups/security-hardening"
 ASSUME_RISKY=0           # if 1, auto-apply risky items without prompting
+SHOW_LAST=0              # if 1, just replay the latest run's transcript and exit
+PW_WORDLIST="${PW_WORDLIST:-}"   # optional custom wordlist for the password audit
 PKG_FAMILY=""            # apt | dnf | yum
 DISTRO_ID=""; DISTRO_VER=""; DISTRO_LIKE=""
 ADMIN_GROUP="sudo"       # sudo (debian) or wheel (rhel)
 SSHD_CONFIG="/etc/ssh/sshd_config"
 
-declare -A BACKED_UP CREATED      # de-dup file backups within a run
+declare -A BACKED_UP CREATED      # de-dup file backups (scoped per task)
 CURRENT_TASK=""
 SELECTED=()                       # output of prompt_selection()
+DEFERRED_DESC=(); DEFERRED_CMD=() # session-disrupting actions, run at the very end
 
 # Colors (only when stdout is a terminal)
 if [[ -t 1 ]]; then
@@ -67,6 +77,8 @@ while [[ $# -gt 0 ]]; do
     --authorized) AUTH_FILE="$2"; shift 2;;
     --state-dir)  STATE_BASE="$2"; shift 2;;
     --yes-risky)  ASSUME_RISKY=1; shift;;
+    --show-last)  SHOW_LAST=1; shift;;
+    --wordlist)   PW_WORDLIST="$2"; shift 2;;
     -h|--help)
       grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -40; exit 0;;
     *) echo "Unknown argument: $1" >&2; exit 1;;
@@ -81,6 +93,18 @@ if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   exit 1
 fi
 
+# --show-last: replay the most recent run's transcript and exit (no changes).
+if [[ $SHOW_LAST -eq 1 ]]; then
+  last="$STATE_BASE/latest/output.log"
+  [[ -e "$last" ]] || last="$(ls -1dt "$STATE_BASE"/run_*/output.log 2>/dev/null | head -1)"
+  if [[ -n "$last" && -r "$last" ]]; then
+    if [[ -t 1 ]] && command -v less >/dev/null 2>&1; then less -R "$last"; else cat "$last"; fi
+  else
+    echo "No previous run transcript found under $STATE_BASE"
+  fi
+  exit 0
+fi
+
 # ----------------------------------------------------------------------------
 # Run directory / logging setup
 # ----------------------------------------------------------------------------
@@ -89,24 +113,36 @@ RUN_DIR="$STATE_BASE/run_$TS"
 BACKUP_DIR="$RUN_DIR/backups"
 ACTIONS_LOG="$RUN_DIR/actions.log"      # machine-readable; consumed by revert.sh
 OUTPUT_LOG="$RUN_DIR/output.log"        # full human transcript
+CREDS_FILE="$RUN_DIR/new-credentials.txt"   # plaintext old/new passwords (root only)
 mkdir -p "$BACKUP_DIR"
 : > "$ACTIONS_LOG"
 : > "$OUTPUT_LOG"
+# These can contain passwords and security details -> restrict to root.
+chmod 700 "$RUN_DIR" "$BACKUP_DIR" 2>/dev/null || true
+chmod 600 "$ACTIONS_LOG" "$OUTPUT_LOG" 2>/dev/null || true
 
-# Stable "latest" pointer so revert.sh can find the most recent run easily.
+# Stable "latest" pointer so revert.sh / --show-last can find the newest run.
 ln -sfn "$RUN_DIR" "$STATE_BASE/latest" 2>/dev/null || true
 
-log()  { echo "${C_BLU}[$(date '+%H:%M:%S')]${C_RST} $*" | tee -a "$OUTPUT_LOG"; }
-info() { echo "    $*" | tee -a "$OUTPUT_LOG"; }
-ok()   { echo "    ${C_GRN}OK:${C_RST} $*" | tee -a "$OUTPUT_LOG"; }
-warn() { echo "    ${C_YEL}WARN:${C_RST} $*" | tee -a "$OUTPUT_LOG"; }
-err()  { echo "    ${C_RED}ERROR:${C_RST} $*" | tee -a "$OUTPUT_LOG"; }
+# Mirror the ENTIRE session (script messages + every command's output) to the
+# live terminal AND output.log via tee, so the full record survives a lost
+# terminal. After re-login, review it with:  sudo ./harden.sh --show-last
+exec > >(tee -a "$OUTPUT_LOG") 2>&1
 
-# Run a command, logging both the command line and its output.
+log()  { echo "${C_BLU}[$(date '+%H:%M:%S')]${C_RST} $*"; }
+info() { echo "    $*"; }
+ok()   { echo "    ${C_GRN}OK:${C_RST} $*"; }
+warn() { echo "    ${C_YEL}WARN:${C_RST} $*"; }
+err()  { echo "    ${C_RED}ERROR:${C_RST} $*"; }
+
+# Run a command, echoing the command line; its output flows through the tee.
 run() {
-  echo "    + $*" >> "$OUTPUT_LOG"
-  "$@" >> "$OUTPUT_LOG" 2>&1
+  echo "    + $*"
+  "$@"
 }
+
+# Queue a session-disrupting command to run at the very end of the whole run.
+defer() { DEFERRED_DESC+=("$1"); DEFERRED_CMD+=("$2"); }
 
 # Record a machine-readable, revertible action line.  Fields are pipe-delimited.
 #   ACTION|<task>|<TYPE>|<arg1>|<arg2>...
@@ -120,9 +156,10 @@ record_action() {
 
 start_task() {  # $1 = task id, $2 = human description
   CURRENT_TASK="$1"
+  BACKED_UP=(); CREATED=()          # backups are scoped per task for clean revert
   echo "TASK_START|$1|$2|$(date -Iseconds)" >> "$ACTIONS_LOG"
-  echo "" | tee -a "$OUTPUT_LOG"
-  echo "${C_BLD}${C_GRN}==> $2${C_RST}" | tee -a "$OUTPUT_LOG"
+  echo ""
+  echo "${C_BLD}${C_GRN}==> $2${C_RST}"
 }
 end_task() {
   echo "TASK_END|${CURRENT_TASK}" >> "$ACTIONS_LOG"
@@ -209,7 +246,7 @@ ask_risky() {
     warn "RISKY (auto-approved via --yes-risky): $desc"
     return 0
   fi
-  echo "    ${C_YEL}${C_BLD}[RISKY]${C_RST} $desc" | tee -a "$OUTPUT_LOG"
+  echo "    ${C_YEL}${C_BLD}[RISKY]${C_RST} $desc"
   local ans
   read -r -p "    Apply this risky change? [y/N]: " ans
   if [[ "${ans,,}" =~ ^(y|yes)$ ]]; then
@@ -229,10 +266,10 @@ prompt_selection() {
     ok "No $noun found."
     return 0
   fi
-  echo "    ${C_BLD}Found ${#items[@]} ${noun}:${C_RST}" | tee -a "$OUTPUT_LOG"
-  printf '      - %s\n' "${items[@]}" | tee -a "$OUTPUT_LOG"
-  echo "    Process ALL of these ${noun}?" | tee -a "$OUTPUT_LOG"
-  echo "    Type 'all' to IGNORE every one of them and SKIP this task (nothing changes)." | tee -a "$OUTPUT_LOG"
+  echo "    ${C_BLD}Found ${#items[@]} ${noun}:${C_RST}"
+  printf '      - %s\n' "${items[@]}"
+  echo "    Process ALL of these ${noun}?"
+  echo "    Type 'all' to IGNORE every one of them and SKIP this task (nothing changes)."
   local ans
   read -r -p "    [y = process all / n = choose which to ignore / all = skip task]: " ans
   case "${ans,,}" in
@@ -454,6 +491,205 @@ sec_passwords() {
     ok "Password aging applied to existing accounts"
   fi
   end_task
+}
+
+# ============================================================================
+# SECTION 2b — Password Strength Audit (detect & reset weak passwords)
+# ============================================================================
+# Strength of an EXISTING password cannot be derived from its hash; the only
+# way to judge it is to test candidate passwords against the hash. We prefer
+# John the Ripper + the rockyou wordlist (the most popular tooling for this),
+# auto-removing john afterward if we installed it (it is a dual-use cracker and
+# is on this toolkit's own purge list). When john/network is unavailable we
+# fall back to a built-in crypt-compare (python3) over a common-password list.
+
+# Generate a strong random password: 20 chars, guaranteeing one of each of the
+# four character classes (the rest random). LC_ALL=C is required so that tr
+# tolerates the binary bytes from /dev/urandom on any locale.
+gen_password() {
+  local lower upper digit special rest
+  lower=$(LC_ALL=C tr -dc 'a-z'        </dev/urandom | head -c1)
+  upper=$(LC_ALL=C tr -dc 'A-Z'        </dev/urandom | head -c1)
+  digit=$(LC_ALL=C tr -dc '0-9'        </dev/urandom | head -c1)
+  special=$(LC_ALL=C tr -dc '!@#%^*_=+-' </dev/urandom | head -c1)
+  rest=$(LC_ALL=C tr -dc 'A-Za-z0-9!@#%^*_=+-' </dev/urandom | head -c16)
+  printf '%s' "${lower}${upper}${digit}${special}${rest}"
+}
+
+# Built-in fallback: try common passwords + username variants against a hash
+# using python3's crypt (handles yescrypt/sha512/md5). Echoes the matched
+# plaintext if weak, nothing if not cracked.
+crack_one_builtin() {
+  local user="$1" hash="$2" wordlist="$3"
+  python3 - "$user" "$hash" "$wordlist" <<'PY'
+import crypt, sys, hmac
+user, stored, wl = sys.argv[1], sys.argv[2], sys.argv[3]
+cands = set()
+try:
+    with open(wl, 'r', encoding='latin-1') as f:
+        for line in f:
+            w = line.rstrip('\n')
+            if w:
+                cands.add(w)
+except OSError:
+    pass
+# username-derived guesses
+for v in (user, user+'123', user+'1', user.capitalize(), user+'2024', user+'2025',
+          'password','Password1','password123','123456','12345678','qwerty',
+          'letmein','admin','root','toor','changeme','welcome','cyberpatriot',
+          'P@ssw0rd','Password123!'):
+    cands.add(v)
+for w in cands:
+    try:
+        if hmac.compare_digest(crypt.crypt(w, stored), stored):
+            print(w); sys.exit(0)
+    except Exception:
+        continue
+sys.exit(1)
+PY
+}
+
+sec_pwaudit() {
+  start_task "pwaudit" "Password Strength Audit (detect & reset weak passwords)"
+  warn "This tests account passwords and RESETS weak ones to a new strong password."
+  warn "Old plaintext+hash are logged (revertable); new passwords saved to: $CREDS_FILE (root only)"
+  if ! confirm "Proceed with the password strength audit?"; then
+    info "Skipped by user."; end_task; return
+  fi
+  command -v python3 >/dev/null 2>&1 || warn "python3 not found; built-in fallback unavailable."
+
+  # The account running this audit (the competitor's assigned user) is NOT
+  # scored for password strength and must keep its password — skip it entirely.
+  local me="${SUDO_USER:-root}"
+
+  # Build the in-scope account list: anything with a usable password hash
+  # (skip locked '!'/'*' and empty entries). Includes root, excludes the
+  # auditing account.
+  local -A USERHASH=()
+  local u h
+  while IFS=: read -r u h _; do
+    if [[ "$u" == "$me" ]]; then
+      info "Skipping '$u' (the account running this audit) — its password is left unchanged."
+      continue
+    fi
+    case "$h" in ""|"!"|"!!"|"*"|"x"|"!*") continue;; esac
+    [[ "$h" == \!* ]] && continue          # locked
+    USERHASH["$u"]="$h"
+  done < /etc/shadow
+  if [[ ${#USERHASH[@]} -eq 0 ]]; then ok "No accounts with a usable password to audit."; end_task; return; fi
+  info "Accounts in scope: ${!USERHASH[*]}"
+
+  # ---- obtain a wordlist (rockyou preferred) ----
+  local wordlist="" tmpd; tmpd="$BACKUP_DIR/pwaudit"; mkdir -p "$tmpd"
+  for w in /usr/share/wordlists/rockyou.txt /usr/share/wordlists/rockyou.txt.gz \
+           "${PW_WORDLIST:-}" ; do
+    [[ -n "$w" && -e "$w" ]] || continue
+    if [[ "$w" == *.gz ]]; then gunzip -c "$w" > "$tmpd/rockyou.txt" 2>/dev/null && wordlist="$tmpd/rockyou.txt"
+    else wordlist="$w"; fi
+    [[ -n "$wordlist" ]] && break
+  done
+  if [[ -z "$wordlist" ]] && is_debian; then
+    info "Installing 'wordlists' package to obtain rockyou..."
+    if pkg_installed wordlists; then :; else WL_INSTALLED=1; pkg_install wordlists; fi
+    [[ -f /usr/share/wordlists/rockyou.txt.gz ]] && gunzip -c /usr/share/wordlists/rockyou.txt.gz > "$tmpd/rockyou.txt" 2>/dev/null && wordlist="$tmpd/rockyou.txt"
+  fi
+  if [[ -z "$wordlist" ]]; then
+    info "Trying to download rockyou.txt..."
+    local url="https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt"
+    if command -v curl >/dev/null 2>&1 && curl -fsSL --max-time 120 "$url" -o "$tmpd/rockyou.txt" 2>/dev/null && [[ -s "$tmpd/rockyou.txt" ]]; then
+      wordlist="$tmpd/rockyou.txt"
+    elif command -v wget >/dev/null 2>&1 && wget -q -T 120 "$url" -O "$tmpd/rockyou.txt" 2>/dev/null && [[ -s "$tmpd/rockyou.txt" ]]; then
+      wordlist="$tmpd/rockyou.txt"
+    fi
+  fi
+  if [[ -z "$wordlist" ]]; then
+    warn "No rockyou wordlist available (offline?). Using built-in common-password list only."
+    : > "$tmpd/rockyou.txt"; wordlist="$tmpd/rockyou.txt"
+  else
+    ok "Using wordlist: $wordlist ($(wc -l < "$wordlist" 2>/dev/null || echo 0) entries)"
+  fi
+
+  # ---- determine weak accounts ----
+  declare -A WEAK=()        # user -> cracked plaintext
+  local JOHN_INSTALLED=0 WL_INSTALLED="${WL_INSTALLED:-0}"
+  local john_bin=""
+  command -v john >/dev/null 2>&1 && john_bin="john"
+  if [[ -z "$john_bin" ]]; then
+    info "Attempting to install John the Ripper for hash auditing..."
+    if is_debian; then pkg_installed john || { JOHN_INSTALLED=1; pkg_install john; }
+    else pkg_installed john || pkg_installed john-the-ripper || { JOHN_INSTALLED=1; pkg_install john || pkg_install john-the-ripper; }; fi
+    command -v john >/dev/null 2>&1 && john_bin="john"
+  fi
+
+  if [[ -n "$john_bin" ]]; then
+    log "Auditing hashes with John the Ripper (this can take a while)..."
+    local combo="$tmpd/combined.txt"
+    if command -v unshadow >/dev/null 2>&1; then unshadow /etc/passwd /etc/shadow > "$combo" 2>/dev/null
+    else cp /etc/shadow "$combo"; fi
+    [[ -s "$wordlist" ]] && run "$john_bin" --wordlist="$wordlist" "$combo"
+    run "$john_bin" --single "$combo"           # username-based rules
+    # collect cracked user:password pairs
+    while IFS=: read -r cu cp _; do
+      [[ -n "$cu" && -n "${USERHASH[$cu]:-}" ]] && WEAK["$cu"]="$cp"
+    done < <("$john_bin" --show "$combo" 2>/dev/null | grep ':' )
+  else
+    warn "John unavailable; using built-in crypt-compare fallback."
+    if command -v python3 >/dev/null 2>&1; then
+      for u in "${!USERHASH[@]}"; do
+        local pw; pw="$(crack_one_builtin "$u" "${USERHASH[$u]}" "$wordlist")"
+        [[ -n "$pw" ]] && WEAK["$u"]="$pw"
+      done
+    else
+      err "Neither john nor python3 available; cannot audit. Aborting section."
+      end_task; return
+    fi
+  fi
+
+  # ---- report & reset ----
+  if [[ ${#WEAK[@]} -eq 0 ]]; then
+    ok "No weak passwords detected among ${#USERHASH[@]} account(s)."
+  else
+    warn "Weak passwords found for: ${!WEAK[*]}"
+    prepare_edit /etc/shadow            # whole-file backup (safety net for revert)
+    : > "$CREDS_FILE"; chmod 600 "$CREDS_FILE"
+    echo "# Generated by harden.sh on $(date)  — KEEP SECRET" >> "$CREDS_FILE"
+    for u in "${!WEAK[@]}"; do
+      local oldpw="${WEAK[$u]}" oldhash="${USERHASH[$u]}" newpw
+      newpw="$(gen_password)"
+      # record original hash for precise, granular revert
+      record_action "USER_PWHASH" "$u" "$oldhash"
+      if printf '%s:%s\n' "$u" "$newpw" | chpasswd; then
+        printf '%-20s OLD(weak)=%-20s NEW=%s\n' "$u" "$oldpw" "$newpw" >> "$CREDS_FILE"
+        echo "    ${C_GRN}RESET${C_RST} ${C_BLD}$u${C_RST}: old weak password '${oldpw}' -> new strong password: ${C_BLD}${newpw}${C_RST}"
+      else
+        err "Failed to reset password for $u"
+      fi
+    done
+    ok "Weak passwords reset. Credentials saved to $CREDS_FILE (root-only)."
+    info "Distribute the new passwords securely; consider 'chage -d 0 <user>' to force a change at next login."
+  fi
+
+  # ---- clean up tools we installed just for the audit (restore original state) ----
+  if [[ "$JOHN_INSTALLED" == "1" ]]; then
+    info "Removing John the Ripper (installed only for this audit; it's a cracking tool)."
+    run pkg_remove_silent john || run pkg_remove_silent john-the-ripper
+  fi
+  if [[ "$WL_INSTALLED" == "1" ]]; then
+    info "Removing 'wordlists' package (installed only for this audit)."
+    run pkg_remove_silent wordlists
+  fi
+  end_task
+}
+
+# Remove a package WITHOUT recording it for revert (used to undo our own
+# temporary audit-tool installs, so the net change is zero).
+pkg_remove_silent() {
+  local p="$1"
+  case "$PKG_FAMILY" in
+    apt) env DEBIAN_FRONTEND=noninteractive apt-get purge -y "$p" >/dev/null 2>&1;;
+    dnf) dnf remove -y "$p" >/dev/null 2>&1;;
+    yum) yum remove -y "$p" >/dev/null 2>&1;;
+  esac
 }
 
 # ============================================================================
@@ -831,7 +1067,7 @@ sec_displaymgr() {
       set_conf_kv "$c" greeter-hide-users true "="
       set_conf_kv "$c" greeter-show-manual-login true "="
       set_conf_kv "$c" autologin-user none "="
-      run systemctl restart lightdm
+      defer "Restart lightdm (this ENDS your graphical session)" "systemctl restart lightdm"
       ;;
     gdm3|gdm)
       local custom; custom=$([[ "$dm" == gdm3 ]] && echo /etc/gdm3/custom.conf || echo /etc/gdm/custom.conf)
@@ -843,7 +1079,7 @@ sec_displaymgr() {
       prepare_edit "$gd"
       printf '[org/gnome/login-screen]\ndisable-user-list=true\n' > "$gd"
       run dconf update
-      run systemctl restart "$dm"
+      defer "Restart $dm (this ENDS your graphical session)" "systemctl restart $dm"
       ;;
     sddm)
       local c=/etc/sddm.conf.d/10-security.conf
@@ -857,10 +1093,11 @@ HideShells=/usr/sbin/nologin,/sbin/nologin,/bin/false
 [Autologin]
 Relogin=false
 EOF
-      run systemctl restart sddm
+      defer "Restart sddm (this ENDS your graphical session)" "systemctl restart sddm"
       ;;
   esac
   ok "$dm hardened (guest disabled, autologin off, user list hidden)"
+  info "The display-manager restart is DEFERRED to the end so it won't kill this run."
   end_task
 }
 
@@ -964,14 +1201,14 @@ sec_tools() {
 sec_forensics() {
   start_task "forensics" "Forensic / Persistence Checks (read-only)"
   log "Listening sockets:";                 run ss -tulpen
-  log "Suspicious reverse-shell processes:"; ps auww | grep -Ei 'nc |ncat|netcat|socat|bash -i|/dev/tcp|python.*socket|perl.*socket|curl.*sh|wget.*sh' | grep -v grep | tee -a "$OUTPUT_LOG"
+  log "Suspicious reverse-shell processes:"; ps auww | grep -Ei 'nc |ncat|netcat|socat|bash -i|/dev/tcp|python.*socket|perl.*socket|curl.*sh|wget.*sh' | grep -v grep
   log "Enabled systemd services:";           run systemctl list-unit-files --type=service --state=enabled
   log "systemd unit ExecStart lines:";       find /etc/systemd/system /lib/systemd/system -type f -name "*.service" -exec grep -H "ExecStart" {} \; >> "$OUTPUT_LOG" 2>&1
   log "System crontab + cron.* dirs:";       { cat /etc/crontab; grep -R . /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly 2>/dev/null; } >> "$OUTPUT_LOG" 2>&1
   log "Per-user crontabs:";                  for u in $(cut -d: -f1 /etc/passwd); do out=$(crontab -l -u "$u" 2>/dev/null); [[ -n "$out" ]] && { echo "== $u =="; echo "$out"; }; done >> "$OUTPUT_LOG" 2>&1
   log "Executable files in tmp/home dirs:";  find /tmp /var/tmp /dev/shm /home /root -type f -perm /111 -ls >> "$OUTPUT_LOG" 2>&1
   log "SSH authorized_keys across users:";    find /root /home -name authorized_keys -exec ls -l {} \; -exec cat {} \; >> "$OUTPUT_LOG" 2>&1
-  log "SUID binaries:";                       find / -perm -4000 -type f 2>/dev/null | tee -a "$OUTPUT_LOG"
+  log "SUID binaries:";                       find / -perm -4000 -type f 2>/dev/null
   log "SGID binaries:";                       find / -perm -2000 -type f 2>/dev/null >> "$OUTPUT_LOG" 2>&1
   if is_rhel; then log "SELinux status:"; run sestatus; else log "AppArmor status:"; run aa-status; fi
   ok "Forensic report written to $OUTPUT_LOG (review it manually)."
@@ -1002,10 +1239,11 @@ sec_mp3() {
 # ============================================================================
 # Menu / dispatch
 # ============================================================================
-SECTION_FUNCS=(sec_user_audit sec_passwords sec_auth_lockout sec_ssh sec_firewall sec_kernel sec_services sec_perms sec_displaymgr sec_auditd sec_autoupdate sec_tools sec_forensics sec_mp3)
+SECTION_FUNCS=(sec_user_audit sec_passwords sec_pwaudit sec_auth_lockout sec_ssh sec_firewall sec_kernel sec_services sec_perms sec_displaymgr sec_auditd sec_autoupdate sec_tools sec_forensics sec_mp3)
 SECTION_DESC=(
   "User & Group Audit (needs authorized.txt)"
   "Password Policies (aging + complexity)"
+  "Password Strength Audit (detect & reset weak passwords)"
   "Account Lockout / Empty Passwords / nullok"
   "SSH Hardening"
   "Firewall (UFW / firewalld)"
@@ -1034,6 +1272,29 @@ print_menu() {
 }
 
 run_section() { local idx="$1"; "${SECTION_FUNCS[$idx]}"; }
+
+# Run any session-disrupting actions that were deferred (e.g. display-manager
+# restart). This is the LAST thing the script does, so losing the terminal here
+# costs nothing — the full transcript is already saved.
+run_deferred() {
+  [[ ${#DEFERRED_CMD[@]} -eq 0 ]] && return 0
+  echo
+  echo "${C_YEL}${C_BLD}=== Deferred actions (these may END your session) ===${C_RST}"
+  echo "Everything else is complete. Full transcript saved to:"
+  echo "  ${C_BLD}$OUTPUT_LOG${C_RST}"
+  echo "After you log back in, review it with:  ${C_BLD}sudo $0 --show-last${C_RST}"
+  echo "Pending:"
+  local i
+  for i in "${!DEFERRED_CMD[@]}"; do echo "  - ${DEFERRED_DESC[$i]}"; done
+  if ! confirm "Run these now? (No = leave them; they take effect on next reboot)"; then
+    warn "Deferred actions NOT run."
+    return 0
+  fi
+  for i in "${!DEFERRED_CMD[@]}"; do
+    log "Deferred: ${DEFERRED_DESC[$i]}"
+    eval "${DEFERRED_CMD[$i]}"
+  done
+}
 
 main() {
   echo "${C_BLD}=== Linux Hardening Tool ===${C_RST}"
@@ -1068,8 +1329,12 @@ main() {
   done
 
   echo
-  log "${C_GRN}${C_BLD}Done.${C_RST}"
+  log "${C_GRN}${C_BLD}All selected sections complete.${C_RST}"
+  log "Transcript: $OUTPUT_LOG   (replay later: sudo $0 --show-last)"
   log "To undo changes: sudo ./revert.sh --log \"$ACTIONS_LOG\""
+
+  # Disruptive actions (display-manager restart) happen here, dead last.
+  run_deferred
 }
 
 main "$@"
