@@ -252,6 +252,144 @@ pam_module_exists() {
   find /lib /usr/lib /usr/lib64 -path "*/security/${module}" -print -quit 2>/dev/null | grep -q .
 }
 
+debian_common_auth_supports_faillock_rewrite() {
+  local af="$1"
+  awk '
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+    /^[[:space:]]*auth[[:space:]]+/ {
+      if ($0 ~ /pam_faillock\.so/) { existing=1 }
+      if ($0 ~ /pam_deny\.so/) { deny=1 }
+      if (!deny && $0 ~ /\[[^]]*success=[0-9]+[^]]*default=ignore[^]]*\]/) { primary=1 }
+    }
+    END { exit ((primary && deny && !existing) ? 0 : 1) }
+  ' "$af"
+}
+
+rewrite_debian_common_auth_for_faillock() {
+  local af="$1" tmp
+  tmp="$(mktemp)" || return 1
+  awk '
+    function bump_success(line,   old, n) {
+      if (match(line, /success=[0-9]+/)) {
+        old = substr(line, RSTART, RLENGTH)
+        n = substr(old, 9) + 1
+        return substr(line, 1, RSTART - 1) "success=" n substr(line, RSTART + RLENGTH)
+      }
+      return line
+    }
+    {
+      if (!inserted_pre && $0 ~ /^[[:space:]]*auth[[:space:]]+/ && $0 !~ /^[[:space:]]*#/) {
+        print "auth    required    pam_faillock.so preauth silent"
+        inserted_pre = 1
+      }
+      if ($0 ~ /^[[:space:]]*auth[[:space:]]+requisite[[:space:]]+pam_deny\.so([[:space:]]|$)/) {
+        print "auth    [default=die]   pam_faillock.so authfail"
+        inserted_fail = 1
+        print
+        next
+      }
+      if (!inserted_fail && $0 ~ /^[[:space:]]*auth[[:space:]]+\[[^]]*success=[0-9]+[^]]*default=ignore[^]]*\]/ && $0 !~ /pam_faillock\.so/) {
+        print bump_success($0)
+        next
+      }
+      print
+    }
+    END { if (!inserted_pre || !inserted_fail) exit 3 }
+  ' "$af" > "$tmp" || { rm -f "$tmp"; return 1; }
+  cat "$tmp" > "$af"
+  rm -f "$tmp"
+}
+
+insert_debian_common_account_faillock() {
+  local ac="$1" tmp
+  tmp="$(mktemp)" || return 1
+  awk '
+    {
+      if (!inserted && $0 ~ /^[[:space:]]*account[[:space:]]+/ && $0 !~ /^[[:space:]]*#/) {
+        print "account required pam_faillock.so"
+        inserted = 1
+      }
+      print
+    }
+    END { if (!inserted) exit 3 }
+  ' "$ac" > "$tmp" || { rm -f "$tmp"; return 1; }
+  cat "$tmp" > "$ac"
+  rm -f "$tmp"
+}
+
+configure_debian_faillock() {
+  local af="/etc/pam.d/common-auth" ac="/etc/pam.d/common-account" fc="/etc/security/faillock.conf"
+  if ! pam_module_exists pam_faillock.so; then
+    warn "pam_faillock.so not found; cannot configure Debian-family faillock safely."
+    return 1
+  fi
+  if [[ ! -f "$af" || ! -f "$ac" ]]; then
+    warn "$af or $ac not found; Debian-family faillock skipped."
+    return 1
+  fi
+  if grep -q "pam_faillock.so" "$af" "$ac" 2>/dev/null; then
+    warn "Existing pam_faillock lines found in $af or $ac; not rewriting an unknown PAM stack."
+    warn "If this is the old authsucc-based harden.sh layout, restore those files from backup/revert first, then rerun."
+    grep -n "pam_faillock.so" "$af" "$ac" 2>/dev/null || true
+    return 1
+  fi
+  if ! debian_common_auth_supports_faillock_rewrite "$af"; then
+    warn "$af does not match the expected Debian/Kali common-auth control-flow shape; skipped to avoid login breakage."
+    warn "Expected at least one auth line with [success=N default=ignore] before 'auth requisite pam_deny.so'."
+    return 1
+  fi
+
+  prepare_edit "$fc"
+  set_conf_kv "$fc" deny 5 " = "
+  set_conf_kv "$fc" unlock_time 900 " = "
+  set_conf_kv "$fc" fail_interval 900 " = "
+
+  prepare_edit "$af"
+  prepare_edit "$ac"
+  if rewrite_debian_common_auth_for_faillock "$af" && insert_debian_common_account_faillock "$ac"; then
+    ok "faillock configured using Debian-family no-authsucc layout in common-auth/common-account"
+    info "Correct-password path: pam_unix success=N is increased by 1, so it skips authfail and pam_deny."
+  else
+    err "Failed to rewrite Debian-family PAM faillock stack; restoring task backups."
+    restore_task_backup "$af"
+    restore_task_backup "$ac"
+    restore_task_backup "$fc"
+    return 1
+  fi
+}
+
+# Best-effort list of the non-root human account(s) tied to this session. This
+# protects the competitor/operator account even when the script was launched
+# from a root shell where SUDO_USER is unavailable.
+detect_invoking_human_accounts() {
+  local -a candidates=()
+  local cand entry uid
+  local -A seen=()
+
+  for cand in "${SUDO_USER:-}" "${LOGNAME:-}" "${USER:-}"; do
+    [[ -n "$cand" ]] && candidates+=("$cand")
+  done
+
+  cand="$(logname 2>/dev/null || true)"
+  [[ -n "$cand" ]] && candidates+=("$cand")
+
+  cand="$(who am i 2>/dev/null | awk '{print $1}')"
+  [[ -n "$cand" ]] && candidates+=("$cand")
+
+  cand="$(id -un 2>/dev/null || true)"
+  [[ -n "$cand" ]] && candidates+=("$cand")
+
+  for cand in "${candidates[@]}"; do
+    [[ -n "$cand" && "$cand" != "root" ]] || continue
+    [[ -n "${seen[$cand]:-}" ]] && continue
+    entry="$(getent passwd "$cand" 2>/dev/null || true)"
+    uid="$(printf '%s\n' "$entry" | awk -F: '{print $3}')"
+    [[ "$uid" =~ ^[0-9]+$ && "$uid" -ge 1000 && "$uid" -lt 65534 ]] || continue
+    seen["$cand"]=1
+    printf '%s\n' "$cand"
+  done
+}
+
 # ----------------------------------------------------------------------------
 # Prompts
 # ----------------------------------------------------------------------------
@@ -924,7 +1062,16 @@ sec_user_audit() {
   info "Authorized users:  ${AUTH_USERS[*]:-(none)}"
   info "Authorized admins: ${AUTH_SUDO[*]:-(none)}"
 
-  local me="${SUDO_USER:-root}"
+  local -A PROTECTED_USERS=()
+  local -a protected_users=()
+  local pu
+  mapfile -t protected_users < <(detect_invoking_human_accounts)
+  if [[ ${#protected_users[@]} -gt 0 ]]; then
+    for pu in "${protected_users[@]}"; do PROTECTED_USERS["$pu"]=1; done
+    info "Protected invoking account(s), not offered for deletion: ${protected_users[*]}"
+  else
+    warn "Could not identify a non-root invoking account; review deletion prompts carefully."
+  fi
 
   # --- UID-0 (root-equivalent) accounts other than root ---
   local uid0
@@ -940,7 +1087,7 @@ sec_user_audit() {
   local u
   for u in "${humans[@]}" "${uid0[@]}"; do
     in_list "$u" "${AUTH_USERS[@]}" && continue
-    [[ "$u" == "$me" ]] && { warn "Account '$u' is unauthorized but is the CURRENT user; not offering deletion."; continue; }
+    [[ -n "${PROTECTED_USERS[$u]:-}" ]] && { warn "Account '$u' is unauthorized but appears to be tied to this session; not offering deletion."; continue; }
     unauth+=("$u")
   done
 
@@ -970,7 +1117,8 @@ sec_user_audit() {
   local admins admin_unauth=()
   mapfile -t admins < <(getent group "$ADMIN_GROUP" | awk -F: '{print $4}' | tr ',' '\n' | sed '/^$/d')
   for u in "${admins[@]}"; do
-    [[ "$u" == "root" || "$u" == "$me" ]] && continue
+    [[ "$u" == "root" ]] && continue
+    [[ -n "${PROTECTED_USERS[$u]:-}" ]] && { warn "Admin '$u' is not listed in authorized [sudoers] but appears to be tied to this session; not offering removal from ${ADMIN_GROUP}."; continue; }
     in_list "$u" "${AUTH_SUDO[@]}" && continue
     admin_unauth+=("$u")
   done
@@ -1250,17 +1398,31 @@ sec_passwords() {
     fi
   fi
 
-  # Apply aging to existing human accounts (risky: affects all users' expiry)
-  if ask_risky "Apply 90/7/12 day aging to ALL existing human accounts (chage)"; then
+  # Apply aging to existing human accounts, excluding the active operator account.
+  local -A PROTECTED_USERS=()
+  local -a protected_users=()
+  local pu
+  mapfile -t protected_users < <(detect_invoking_human_accounts)
+  if [[ ${#protected_users[@]} -gt 0 ]]; then
+    for pu in "${protected_users[@]}"; do PROTECTED_USERS["$pu"]=1; done
+    info "Password aging will skip protected invoking/session account(s): ${protected_users[*]}"
+  else
+    warn "Could not identify a non-root invoking account; review the chage scope before approving."
+  fi
+  if ask_risky "Apply 90/7/12 day aging to existing human accounts except protected invoking/session accounts (chage)"; then
     local u
     while IFS= read -r u; do
+      if [[ -n "${PROTECTED_USERS[$u]:-}" ]]; then
+        info "Skipping password aging for protected invoking/session account '$u'."
+        continue
+      fi
       # record current aging so revert can restore it
       local cur
       cur=$(chage -l "$u" 2>/dev/null | awk -F: '/Maximum/{m=$2} /Minimum/{n=$2} /warning/{w=$2} END{gsub(/ /,"",m);gsub(/ /,"",n);gsub(/ /,"",w);print m":"n":"w}')
       record_action "CHAGE" "$u" "${cur:-:::}"
       run chage -M 90 -m 7 -W 12 "$u"
     done < <(awk -F: '$3>=1000 && $1!="nobody"{print $1}' /etc/passwd)
-    ok "Password aging applied to existing accounts"
+    ok "Password aging applied to non-protected existing accounts"
   fi
   end_task
 }
@@ -1348,18 +1510,35 @@ sec_pwaudit() {
     warn "python3 not found; built-in fallback unavailable."
   fi
 
-  # The account running this audit (the competitor's assigned user) is NOT
-  # scored for password strength and must keep its password — skip it entirely.
-  local me="${SUDO_USER:-root}"
+  # The competitor/operator account is NOT scored for password strength and must
+  # keep its password. Detect it from sudo and login-session hints, not SUDO_USER
+  # alone, because root shells often drop SUDO_USER.
+  local -A PROTECTED_USERS=()
+  local -a protected_users=()
+  local pu
+  mapfile -t protected_users < <(detect_invoking_human_accounts)
+  local detected_human_count="${#protected_users[@]}"
+  for pu in "${protected_users[@]}"; do PROTECTED_USERS["$pu"]=1; done
+  if [[ -z "${SUDO_USER:-}" || "${SUDO_USER:-}" == "root" ]]; then
+    PROTECTED_USERS["root"]=1
+    protected_users+=("root")
+    warn "SUDO_USER is not set to a non-root account; protecting root from password resets for this run."
+  fi
+  if [[ $detected_human_count -eq 0 ]]; then
+    warn "Could not identify a non-root invoking account. If you are using a root shell, verify your operator account is not listed in 'Accounts in scope' before proceeding."
+  fi
+  if [[ ${#protected_users[@]} -gt 0 ]]; then
+    info "Password audit will not change protected account(s): ${protected_users[*]}"
+  fi
 
   # Build the in-scope account list: anything with a usable password hash
-  # (skip locked '!'/'*' and empty entries). Includes root, excludes the
-  # auditing account.
+  # (skip locked '!'/'*' and empty entries). Includes root unless this was
+  # launched from a root shell with no non-root SUDO_USER.
   local -A USERHASH=()
   local u h
   while IFS=: read -r u h _; do
-    if [[ "$u" == "$me" ]]; then
-      info "Skipping '$u' (the account running this audit) — its password is left unchanged."
+    if [[ -n "${PROTECTED_USERS[$u]:-}" ]]; then
+      info "Skipping '$u' (protected invoking/session account) — its password is left unchanged."
       continue
     fi
     case "$h" in ""|"!"|"!!"|"*"|"x"|"!*") continue;; esac
@@ -1455,23 +1634,27 @@ sec_pwaudit() {
     ok "No weak passwords detected among ${#USERHASH[@]} account(s)."
   else
     warn "Weak passwords found for: ${!WEAK[*]}"
-    prepare_edit /etc/shadow            # whole-file backup (safety net for revert)
-    : > "$CREDS_FILE"; chmod 600 "$CREDS_FILE"
-    echo "# Generated by harden.sh on $(date)  — KEEP SECRET" >> "$CREDS_FILE"
-    for u in "${!WEAK[@]}"; do
-      local oldpw="${WEAK[$u]}" oldhash="${USERHASH[$u]}" newpw
-      newpw="$(gen_password)"
-      # record original hash for precise, granular revert
-      record_action "USER_PWHASH" "$u" "$oldhash"
-      if printf '%s:%s\n' "$u" "$newpw" | chpasswd; then
-        printf '%-20s OLD(weak)=%-20s NEW=%s\n' "$u" "$oldpw" "$newpw" >> "$CREDS_FILE"
-        echo "    ${C_GRN}RESET${C_RST} ${C_BLD}$u${C_RST}: old weak password '${oldpw}' -> new strong password: ${C_BLD}${newpw}${C_RST}"
-      else
-        err "Failed to reset password for $u"
-      fi
-    done
-    ok "Weak passwords reset. Credentials saved to $CREDS_FILE (root-only)."
-    info "Distribute the new passwords securely; consider 'chage -d 0 <user>' to force a change at next login."
+    if ! confirm "Reset weak passwords for these accounts now? Outcome: new passwords are written to $CREDS_FILE. Risk: affected users cannot log in until given the new password"; then
+      info "Skipped weak-password resets; no password hashes changed."
+    else
+      prepare_edit /etc/shadow            # whole-file backup (safety net for revert)
+      : > "$CREDS_FILE"; chmod 600 "$CREDS_FILE"
+      echo "# Generated by harden.sh on $(date)  — KEEP SECRET" >> "$CREDS_FILE"
+      for u in "${!WEAK[@]}"; do
+        local oldpw="${WEAK[$u]}" oldhash="${USERHASH[$u]}" newpw
+        newpw="$(gen_password)"
+        # record original hash for precise, granular revert
+        record_action "USER_PWHASH" "$u" "$oldhash"
+        if printf '%s:%s\n' "$u" "$newpw" | chpasswd; then
+          printf '%-20s OLD(weak)=%-20s NEW=%s\n' "$u" "$oldpw" "$newpw" >> "$CREDS_FILE"
+          echo "    ${C_GRN}RESET${C_RST} ${C_BLD}$u${C_RST}: old weak password '${oldpw}' -> new strong password: ${C_BLD}${newpw}${C_RST}"
+        else
+          err "Failed to reset password for $u"
+        fi
+      done
+      ok "Weak passwords reset. Credentials saved to $CREDS_FILE (root-only)."
+      info "Distribute the new passwords securely; consider 'chage -d 0 <user>' to force a change at next login."
+    fi
   fi
 
   # ---- clean up tools we installed just for the audit (restore original state) ----
@@ -1505,14 +1688,35 @@ sec_auth_lockout() {
   start_task "auth_lockout" "Account Lockout / Empty Passwords / nullok"
   require_supported_write "Account Lockout / Empty Passwords / nullok" || { end_task; return; }
 
+  local -A PROTECTED_USERS=()
+  local -a protected_users=()
+  local pu
+  mapfile -t protected_users < <(detect_invoking_human_accounts)
+  if [[ ${#protected_users[@]} -gt 0 ]]; then
+    for pu in "${protected_users[@]}"; do PROTECTED_USERS["$pu"]=1; done
+    info "Account lockout tasks will skip protected invoking/session account(s): ${protected_users[*]}"
+  else
+    warn "Could not identify a non-root invoking account; review account-locking prompts carefully."
+  fi
+
   # --- empty password accounts ---
-  local empties
+  local empties lockable_empties=()
   mapfile -t empties < <(awk -F: '($2==""){print $1}' /etc/shadow)
   if [[ ${#empties[@]} -gt 0 ]]; then
     warn "Accounts with EMPTY passwords: ${empties[*]}"
-    if confirm "Lock all empty-password accounts (passwd -l)?"; then
+    local u
+    for u in "${empties[@]}"; do
+      if [[ -n "${PROTECTED_USERS[$u]:-}" ]]; then
+        warn "Skipping empty-password lock for protected invoking/session account '$u'. Set a real password manually before logging out."
+      else
+        lockable_empties+=("$u")
+      fi
+    done
+    if [[ ${#lockable_empties[@]} -eq 0 ]]; then
+      ok "No lockable empty-password accounts after protecting invoking/session account(s)."
+    elif confirm "Lock empty-password accounts not tied to this session (passwd -l)?"; then
       local u
-      for u in "${empties[@]}"; do
+      for u in "${lockable_empties[@]}"; do
         record_action "USER_LOCK" "$u"
         run passwd -l "$u" && ok "Locked $u"
       done
@@ -1539,28 +1743,50 @@ sec_auth_lockout() {
   fi
 
   # --- faillock (lockout after failed attempts) ---
-  if ask_risky "Enable account lockout after 5 failed logins (pam_faillock). Misconfigured PAM can lock out ALL logins; this run backs up PAM files and revert.sh can restore them"; then
-    if is_rhel && command -v authselect >/dev/null 2>&1; then
-      prepare_edit /etc/security/faillock.conf
-      set_conf_kv /etc/security/faillock.conf deny        5   " = "
-      set_conf_kv /etc/security/faillock.conf unlock_time 900 " = "
-      set_conf_kv /etc/security/faillock.conf fail_interval 900 " = "
-      record_action "AUTHSELECT_FEATURE" "with-faillock"
-      run authselect enable-feature with-faillock
-      run authselect apply-changes
-      ok "faillock enabled via authselect"
-    elif is_debian; then
-      local af="/etc/pam.d/common-auth" ac="/etc/pam.d/common-account"
-      prepare_edit "$af"; prepare_edit "$ac"
-      if ! grep -q "pam_faillock.so preauth" "$af"; then
-        sed -i '1i auth    required    pam_faillock.so preauth silent deny=5 unlock_time=900 fail_interval=900' "$af"
+  if command -v faillock >/dev/null 2>&1; then
+    if [[ ${#protected_users[@]} -gt 0 ]]; then
+      for pu in "${protected_users[@]}"; do
+        info "Current faillock records for '$pu' (read-only):"
+        run faillock --user "$pu" || true
+      done
+    else
+      info "faillock is installed; no protected invoking account was detected for a user-specific read-only check."
+    fi
+  else
+    info "faillock command not found; skipping faillock status check."
+  fi
+
+  if ask_risky "Enable account lockout after 5 failed logins (pam_faillock). Debian/Kali uses corrected no-authsucc PAM layout; RHEL/Fedora uses authselect. Keep a root/rescue shell open and test TTY/GUI/sudo before logout"; then
+    if is_debian; then
+      configure_debian_faillock
+    elif is_rhel; then
+      if command -v authselect >/dev/null 2>&1; then
+        prepare_edit /etc/security/faillock.conf
+        set_conf_kv /etc/security/faillock.conf deny 5 " = "
+        set_conf_kv /etc/security/faillock.conf unlock_time 900 " = "
+        set_conf_kv /etc/security/faillock.conf fail_interval 900 " = "
+        run authselect current || true
+        local had_faillock=0
+        authselect current 2>/dev/null | grep -q 'with-faillock' && had_faillock=1
+        if ! run authselect check; then
+          warn "authselect reports local PAM/profile changes; not enabling with-faillock automatically."
+          restore_task_backup /etc/security/faillock.conf
+        elif [[ $had_faillock -eq 1 ]]; then
+          ok "authselect with-faillock is already enabled; faillock.conf updated only."
+        else
+          record_action "AUTHSELECT_FEATURE" "with-faillock"
+          if run authselect enable-feature with-faillock && run authselect apply-changes; then
+            ok "faillock enabled via authselect with-faillock"
+          else
+            err "authselect failed to enable/apply with-faillock; attempting to roll back the feature."
+            run authselect disable-feature with-faillock || true
+            run authselect apply-changes || true
+            restore_task_backup /etc/security/faillock.conf
+          fi
+        fi
+      else
+        warn "authselect not found; not hand-editing RHEL-family PAM files."
       fi
-      if ! grep -q "pam_faillock.so authfail" "$af"; then
-        # place authfail/authsucc after the primary pam_unix line
-        sed -i '/pam_unix.so/a auth    [default=die]   pam_faillock.so authfail deny=5 unlock_time=900 fail_interval=900\nauth    sufficient      pam_faillock.so authsucc' "$af"
-      fi
-      grep -q "pam_faillock.so" "$ac" || echo "account required pam_faillock.so" >> "$ac"
-      ok "faillock configured in common-auth/common-account"
     else
       warn "No supported method to configure faillock on this system; skipped."
     fi

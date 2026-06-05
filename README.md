@@ -106,9 +106,10 @@ candidates against it. This section:
    password, sets it, and writes `OLD(weak)` + `NEW` to a root-only `new-credentials.txt`
    in the run dir (also echoed to the console). The original hash is recorded so it's
    fully revertible. Covers **all** accounts with a usable password, including root, but
-   **skips the account running the audit** (`$SUDO_USER`, i.e. the competitor's assigned
-   user — not scored for password strength, and skipping it avoids changing the password
-   on the session you're logged in with).
+   **skips the account(s) tied to the active sudo/login session** (`$SUDO_USER`, `logname`,
+   `who am i`, `LOGNAME`, or `USER`). If the script is launched from a root shell where no
+   non-root invoking user can be identified, it protects root and warns you to verify the
+   displayed account scope before any reset.
 
 > ⚠️ **john is a dual-use cracker and is on this toolkit's own purge list.** Using it to
 > audit *your own* system is legitimate, but if the script installs it just for the audit
@@ -135,9 +136,11 @@ candidates against it. This section:
 - Apache/Nginx directory-listing and browser-header hardening (can break intentional indexes, embeds, or cross-origin flows)
 - PHP dangerous-function/session-cookie hardening (can break apps that call shell functions or use HTTP-only sessions)
 - AIDE baseline initialization (trusts the current filesystem state)
-- `pam_faillock` lockout-after-failures
+- `pam_faillock` lockout-after-failures (Debian/Kali uses a corrected no-`authsucc`
+  stack rewrite; RHEL/Fedora uses `authselect with-faillock`)
 - Restricting `su` to the distro admin group (`sudo` or `wheel`)
-- Applying password aging to existing accounts
+- Applying password aging to existing accounts except protected invoking/session accounts
+- Locking empty-password accounts except protected invoking/session accounts
 - Resetting weak passwords (section 10 — confirmed before running)
 - Apache ModSecurity setup in DetectionOnly mode
 - Top-level home directory privacy and common log permission tightening
@@ -169,11 +172,60 @@ Debian / Ubuntu and Debian-like apt distros:
 RHEL / Fedora / AlmaLinux / Rocky Linux:
 - Uses `dnf` or `yum`, `dnf-automatic` or `yum-cron`, firewalld, SELinux,
   `wheel`, `audit`, `rsyslog`, `psacct`, and `sshd`.
-- Uses `authselect` for `faillock`; authselect-managed PAM files are inspected
-  but not hand-edited for `pam_pwquality`.
+- Enables `faillock` through `authselect with-faillock` after `authselect check`
+  passes; authselect-managed PAM files are not hand-edited.
 - Uses RHEL-family paths such as `/etc/httpd`, `/etc/php.ini`, `/etc/my.cnf.d`,
   and BIND config locations when present. Apache ModSecurity uses `mod_security`
   when available.
+
+`pam_faillock` lockout is prompted because bad PAM ordering can lock out GUI, TTY,
+and sudo authentication. Older versions of this script blindly inserted this
+Debian/Kali-family layout:
+
+```
+/etc/pam.d/common-auth:
+auth    required    pam_faillock.so preauth silent deny=5 unlock_time=900 fail_interval=900
+auth    [default=die]   pam_faillock.so authfail deny=5 unlock_time=900 fail_interval=900
+auth    sufficient      pam_faillock.so authsucc
+
+/etc/pam.d/common-account:
+account required pam_faillock.so
+```
+
+The fragile line was `auth sufficient pam_faillock.so authsucc`: if it did not
+return clean success in that service context, Debian's fallback `pam_deny.so`
+could still run after a correct password. The current script instead uses the
+Linux-PAM account-phase pattern: it does **not** add `authsucc`, inserts only an
+`authfail` line before `pam_deny.so`, and increments Debian/Kali
+`[success=N default=ignore]` controls by 1 so a successful password skips both
+`authfail` and `pam_deny.so`.
+
+Current Debian/Kali-family target shape:
+
+```
+/etc/security/faillock.conf:
+deny = 5
+unlock_time = 900
+fail_interval = 900
+
+/etc/pam.d/common-auth:
+auth    required    pam_faillock.so preauth silent
+auth    [success=N+1 default=ignore] pam_unix.so ...
+auth    [default=die]   pam_faillock.so authfail
+auth    requisite       pam_deny.so
+
+/etc/pam.d/common-account:
+account required pam_faillock.so
+```
+
+For RHEL/Fedora-family systems, the script uses:
+
+```
+authselect enable-feature with-faillock
+authselect apply-changes
+```
+
+Keep a root/rescue shell open and test TTY/GUI/sudo before logout.
 
 Systemd note:
 - Write tasks that manage services require `systemctl`; non-systemd support is
