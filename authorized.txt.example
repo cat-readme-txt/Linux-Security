@@ -10,12 +10,18 @@
 # RULES:
 #   * Lines starting with '#' are comments. Blank lines are ignored.
 #   * Inline comments after a value are allowed (everything after '#' is dropped).
-#   * Two sections, introduced exactly by [users] and [sudoers]:
+#   * Three sections, introduced exactly by [users], [sudoers], and [groups]:
 #       [users]   = EVERY human login account that is allowed to exist.
 #       [sudoers] = the subset of those users allowed admin (sudo/wheel) access.
+#       [groups]  = add-only group memberships in "group: user1 user2" format.
 #   * Any human account (UID >= 1000) NOT under [users] is flagged for deletion.
+#   * Any user under [users] that does not exist can be created after confirmation;
+#     the generated password is saved to root-only new-credentials.txt.
 #   * Any sudo/wheel member NOT under [sudoers] is flagged for removal from that
 #     group (the account itself is kept).
+#   * [groups] never removes users from non-admin groups. It only adds listed
+#     users when they are not already members. Missing groups can be created
+#     after confirmation. Use [sudoers] for sudo/wheel.
 #   * The account currently running the script is never offered for deletion.
 #   * 'root' is handled automatically and does not need to be listed.
 
@@ -27,3 +33,7 @@ charlie
 [sudoers]
 alice
 bob
+
+[groups]
+www-data: alice bob
+developers: charlie

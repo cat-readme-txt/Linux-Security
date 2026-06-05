@@ -12,7 +12,10 @@ Fully supported write-hardening targets:
 - **Debian / Ubuntu** with `apt`
 - **Debian/Ubuntu-like apt distros** using `ID_LIKE=debian` or `ID_LIKE=ubuntu`
   such as Linux Mint, Pop!_OS, and Kali
-- **RHEL / Fedora / AlmaLinux / Rocky Linux** with `dnf` or `yum`
+- **RHEL / Fedora-family distros** with `dnf` or `yum`, including RHEL, Fedora,
+  AlmaLinux, Rocky Linux, CentOS Stream, Oracle Linux, and Amazon Linux
+- **SUSE-family distros** with `zypper`, including openSUSE and SUSE Linux
+  Enterprise
 
 Other distros are treated as unsupported for write-hardening. Read-only checks
 can still run, but write-capable tasks print an unsupported-distro message and
@@ -25,7 +28,7 @@ skip instead of guessing.
 ```bash
 # 1. (only needed for the user audit) describe who is allowed:
 cp authorized.txt.example authorized.txt
-$EDITOR authorized.txt            # put the REAL authorized users/sudoers in it
+$EDITOR authorized.txt            # put the REAL authorized users/sudoers/groups in it
 
 # 2. run the hardening tool
 sudo ./harden.sh
@@ -33,6 +36,32 @@ sudo ./harden.sh
 # 3. if you need to undo something
 sudo ./revert.sh                  # uses the most recent run automatically
 ```
+
+`authorized.txt` supports three sections:
+
+```
+[users]
+alice
+bob
+charlie
+
+[sudoers]
+alice
+bob
+
+[groups]
+www-data: alice bob
+developers: charlie
+```
+
+`[users]` lists human accounts allowed to exist. If a listed user does not
+exist, the User & Group Audit can create it after confirmation with a generated
+password saved to root-only `new-credentials.txt`. `[sudoers]` lists users
+allowed in the distro admin group (`sudo` or `wheel`); users already in that
+group but not listed can be removed after confirmation. `[groups]` is add-only
+for non-admin groups: listed users are added if missing, missing groups can be
+created after confirmation, and omitted users are never removed from those
+groups. Use `[sudoers]`, not `[groups]`, for admin access.
 
 ## `harden.sh`
 
@@ -120,8 +149,8 @@ candidates against it. This section:
 - Full package upgrade (can restart or change scored services)
 - Web/app and DB backup snapshots (can be slow and stores secrets in the run dir)
 - SSH port 22 → 2222
-- `PasswordAuthentication no` (skipped automatically if no SSH keys exist)
-- `AllowGroups sshusers`
+- SSH authentication mode changes: key-only, key+password, or password-only
+- `AllowGroups sshusers` (prompts before adding the current operator account)
 - Enabling the firewall (SSH is allowed first to avoid lockout)
 - Enabling `fail2ban` (can ban scoring/Orange Team source IPs if misconfigured)
 - `fail2ban` ignore-list entries (trusted IPs/CIDRs will never be banned)
@@ -169,14 +198,28 @@ Debian / Ubuntu and Debian-like apt distros:
   `/etc/php/*/*/php.ini` when present. Apache ModSecurity uses
   `libapache2-mod-security2` when available.
 
-RHEL / Fedora / AlmaLinux / Rocky Linux:
+RHEL / Fedora-family distros:
 - Uses `dnf` or `yum`, `dnf-automatic` or `yum-cron`, firewalld, SELinux,
-  `wheel`, `audit`, `rsyslog`, `psacct`, and `sshd`.
+  `wheel`, `audit`, `rsyslog`, `psacct`, and `sshd`. CentOS Stream, Oracle
+  Linux, and Amazon Linux are routed through this family when `dnf` or `yum`
+  is available.
 - Enables `faillock` through `authselect with-faillock` after `authselect check`
   passes; authselect-managed PAM files are not hand-edited.
 - Uses RHEL-family paths such as `/etc/httpd`, `/etc/php.ini`, `/etc/my.cnf.d`,
   and BIND config locations when present. Apache ModSecurity uses `mod_security`
   when available.
+
+openSUSE / SUSE Linux Enterprise:
+- Uses `zypper`, `firewalld`, AppArmor, `wheel`, RPM verification, `audit`,
+  `rsyslog`, `psacct`, and `sshd`.
+- Configures a reversible systemd timer that runs `zypper --non-interactive
+  patch -g security` daily for security patches.
+- Uses SUSE Apache paths such as `/etc/apache2/httpd.conf` and
+  `/etc/apache2/conf.d`. Apache ModSecurity tries SUSE package names first.
+- Does **not** hand-edit SUSE PAM stacks for `pam_pwquality` or `pam_faillock`.
+  SUSE global PAM files are maintained with `pam-config`, so the script reports
+  pam-config status/guidance and skips automatic lockout wiring to avoid the
+  kind of login breakage seen on Kali.
 
 `pam_faillock` lockout is prompted because bad PAM ordering can lock out GUI, TTY,
 and sudo authentication. Older versions of this script blindly inserted this
@@ -266,5 +309,8 @@ It asks once whether to also uninstall packages the tool installed (default: kee
   `ftpd_banner` and validates/restores around service restart.
 - `Protocol 2` is **not** emitted — it's removed on OpenSSH ≥ 7.6 and would fail `sshd -t`.
 - SSH config is validated with `sshd -t` before restart; on failure the backup is restored.
-- `PasswordAuthentication no` is only offered when SSH keys actually exist.
+- Key-only SSH is not applied unless the current operator has a valid-looking
+  authorized key or approves generation of a new ed25519 key. Generated private
+  keys are saved under the root-only run directory and are displayed only after
+  a separate warning prompt.
 - Firewall always allows SSH **before** enabling, to prevent lockout.

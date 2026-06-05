@@ -148,6 +148,7 @@ pkg_install() {
     apt) DEBIAN_FRONTEND=noninteractive apt-get install -y "$p";;
     dnf) dnf install -y "$p";;
     yum) yum install -y "$p";;
+    zypper) zypper --non-interactive install "$p";;
     *)   echo "  ${C_YEL}unknown pkg family '$fam' for $p${C_RST}";;
   esac
 }
@@ -157,6 +158,7 @@ pkg_remove() {
     apt) DEBIAN_FRONTEND=noninteractive apt-get purge -y "$p";;
     dnf) dnf remove -y "$p";;
     yum) yum remove -y "$p";;
+    zypper) zypper --non-interactive remove "$p";;
   esac
 }
 
@@ -183,7 +185,11 @@ revert_action() {
       else echo "  ${C_YEL}backup missing for $a1 ($a2)${C_RST}"; fi
       ;;
     FILE_CREATE)
-      if [[ -e "$a1" ]]; then rm -f "$a1" && echo "  ${C_GRN}removed${C_RST} created file $a1"; fi
+      if [[ -e "$a1" ]]; then
+        rm -f "$a1" && echo "  ${C_GRN}removed${C_RST} created file $a1"
+        [[ "$a1" == /etc/systemd/system/*.service || "$a1" == /etc/systemd/system/*.timer ]] \
+          && systemctl daemon-reload >/dev/null 2>&1
+      fi
       ;;
     PERM)
       if [[ -e "$a1" ]]; then
@@ -225,6 +231,12 @@ revert_action() {
         tar xzf "$a3" -C / && echo "  ${C_GRN}restored home${C_RST} for $a1 (from $a3)"
       else
         echo "  ${C_YEL}no home archive for $a1; account entry restored from passwd/shadow backups only${C_RST}"
+      fi
+      ;;
+    USER_CREATE)
+      if getent passwd "$a1" >/dev/null 2>&1; then
+        userdel -r "$a1" >/dev/null 2>&1 && echo "  ${C_GRN}deleted created user${C_RST} $a1" \
+          || echo "  ${C_YEL}could not delete created user${C_RST} $a1"
       fi
       ;;
     GROUP_MEMBER)      # user WAS a member; harden removed them -> re-add

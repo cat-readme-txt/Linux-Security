@@ -3,7 +3,8 @@
 # harden.sh — Menu-driven Linux security hardening tool
 # ============================================================================
 # Implements the checks in the "Linux System Checklist", with corrections.
-# Fully supports Debian/Ubuntu (apt) and RHEL/Fedora/Alma/Rocky (dnf/yum).
+# Fully supports Debian/Ubuntu (apt), RHEL-family (dnf/yum), and SUSE-family
+# (zypper) systems listed in README.md.
 #
 # Every change is LOGGED and BACKED UP so it can be undone with revert.sh.
 #
@@ -12,7 +13,7 @@
 # ----------------------------------------------------------------------------
 # Create a plain-text file (default: ./authorized.txt, or pass --authorized PATH)
 # before running. Lines beginning with '#' are comments; blank lines are ignored.
-# It has two sections introduced by [users] and [sudoers]:
+# It has three sections introduced by [users], [sudoers], and [groups]:
 #
 #     # ---- example authorized.txt ----
 #     [users]
@@ -22,10 +23,18 @@
 #     [sudoers]
 #     alice          # the subset of users allowed admin (sudo/wheel) access
 #     bob
+#     [groups]
+#     www-data: alice bob      # add-only: ensure alice/bob are members
+#     developers: charlie      # missing entries do NOT remove existing members
 #
 #  * Any human account (UID >= 1000) NOT under [users] is flagged as unauthorized.
+#  * Any user under [users] that does not exist can be created after confirmation;
+#    the generated password is saved to the root-only new-credentials.txt.
 #  * Any member of the sudo/wheel group NOT under [sudoers] is flagged for removal
 #    from that group.
+#  * [groups] is add-only for non-admin groups. It never removes existing members.
+#    Missing groups can be created after confirmation, then listed users are
+#    added. Use [sudoers], not [groups], to authorize sudo/wheel membership.
 #  * The account currently running the script is never offered for deletion.
 # ----------------------------------------------------------------------------
 #
@@ -52,11 +61,11 @@ ASSUME_RISKY=0           # if 1, auto-apply risky items without prompting
 COMPETITION_SAFE=0       # if 1, run read-only preflight first and never auto-approve risky changes
 SHOW_LAST=0              # if 1, just replay the latest run's transcript and exit
 PW_WORDLIST="${PW_WORDLIST:-}"   # optional custom wordlist for the password audit
-PKG_FAMILY=""            # apt | dnf | yum
-DISTRO_FAMILY="unsupported"  # debian | rhel | unsupported
+PKG_FAMILY=""            # apt | dnf | yum | zypper
+DISTRO_FAMILY="unsupported"  # debian | rhel | suse | unsupported
 WRITE_SUPPORTED=0        # 1 only for the fully supported distro families
 DISTRO_ID=""; DISTRO_VER=""; DISTRO_LIKE=""
-ADMIN_GROUP="sudo"       # sudo (debian) or wheel (rhel)
+ADMIN_GROUP="sudo"       # sudo (debian) or wheel (rhel/suse)
 SSHD_CONFIG="/etc/ssh/sshd_config"
 
 declare -A BACKED_UP CREATED      # per-task staging backups for same-task rollback
@@ -317,25 +326,46 @@ insert_debian_common_account_faillock() {
   rm -f "$tmp"
 }
 
+print_debian_faillock_manual_plan() {
+  local reason="$1" af="${2:-/etc/pam.d/common-auth}" ac="${3:-/etc/pam.d/common-account}" fc="${4:-/etc/security/faillock.conf}"
+  warn "Debian-family pam_faillock was not applied automatically."
+  warn "Reason: $reason"
+  info "Intended manual update to review before editing:"
+  info "1. Confirm pam_faillock.so exists under /lib, /usr/lib, or /usr/lib64 security module paths."
+  info "2. In $fc, set:"
+  info "   deny = 5"
+  info "   unlock_time = 900"
+  info "   fail_interval = 900"
+  info "3. In $af, only if the stack has '[success=N default=ignore]' before 'auth requisite pam_deny.so':"
+  info "   - Insert before the first active auth line:"
+  info "     auth    required    pam_faillock.so preauth silent"
+  info "   - Increase that pam_unix success=N value by 1, so the success path skips both authfail and pam_deny."
+  info "   - Insert immediately before 'auth requisite pam_deny.so':"
+  info "     auth    [default=die]   pam_faillock.so authfail"
+  info "   - Do NOT add an 'authsucc' line on Debian/Kali common-auth."
+  info "4. In $ac, insert before the first active account line:"
+  info "     account required pam_faillock.so"
+  info "5. Keep a root/rescue shell open and test TTY, GUI, sudo, and SSH before logging out."
+}
+
 configure_debian_faillock() {
   local af="/etc/pam.d/common-auth" ac="/etc/pam.d/common-account" fc="/etc/security/faillock.conf"
   if ! pam_module_exists pam_faillock.so; then
-    warn "pam_faillock.so not found; cannot configure Debian-family faillock safely."
+    print_debian_faillock_manual_plan "pam_faillock.so was not found, so the module cannot be wired safely." "$af" "$ac" "$fc"
     return 1
   fi
   if [[ ! -f "$af" || ! -f "$ac" ]]; then
-    warn "$af or $ac not found; Debian-family faillock skipped."
+    print_debian_faillock_manual_plan "$af or $ac was not found." "$af" "$ac" "$fc"
     return 1
   fi
   if grep -q "pam_faillock.so" "$af" "$ac" 2>/dev/null; then
-    warn "Existing pam_faillock lines found in $af or $ac; not rewriting an unknown PAM stack."
+    print_debian_faillock_manual_plan "Existing pam_faillock lines were found in $af or $ac; refusing to rewrite an unknown PAM stack." "$af" "$ac" "$fc"
     warn "If this is the old authsucc-based harden.sh layout, restore those files from backup/revert first, then rerun."
     grep -n "pam_faillock.so" "$af" "$ac" 2>/dev/null || true
     return 1
   fi
   if ! debian_common_auth_supports_faillock_rewrite "$af"; then
-    warn "$af does not match the expected Debian/Kali common-auth control-flow shape; skipped to avoid login breakage."
-    warn "Expected at least one auth line with [success=N default=ignore] before 'auth requisite pam_deny.so'."
+    print_debian_faillock_manual_plan "$af did not match the expected Debian/Kali control-flow shape. Expected '[success=N default=ignore]' before 'auth requisite pam_deny.so'." "$af" "$ac" "$fc"
     return 1
   fi
 
@@ -354,6 +384,7 @@ configure_debian_faillock() {
     restore_task_backup "$af"
     restore_task_backup "$ac"
     restore_task_backup "$fc"
+    print_debian_faillock_manual_plan "The rewrite command failed after safety checks; task backups were restored." "$af" "$ac" "$fc"
     return 1
   fi
 }
@@ -473,7 +504,7 @@ detect_distro() {
         WRITE_SUPPORTED=1
       fi
       ;;
-    rhel|fedora|almalinux|rocky)
+    rhel|fedora|almalinux|rocky|centos|ol|amzn)
       DISTRO_FAMILY="rhel"
       ADMIN_GROUP="wheel"
       if command -v dnf >/dev/null 2>&1; then
@@ -484,11 +515,33 @@ detect_distro() {
         WRITE_SUPPORTED=1
       fi
       ;;
+    opensuse*|sles|sled|sle_hpc|suse)
+      DISTRO_FAMILY="suse"
+      ADMIN_GROUP="wheel"
+      if command -v zypper >/dev/null 2>&1; then
+        PKG_FAMILY="zypper"
+        WRITE_SUPPORTED=1
+      fi
+      ;;
     *)
       if [[ "$like" == *" debian "* || "$like" == *" ubuntu "* ]] && command -v apt-get >/dev/null 2>&1; then
         DISTRO_FAMILY="debian"
         ADMIN_GROUP="sudo"
         PKG_FAMILY="apt"
+        WRITE_SUPPORTED=1
+      elif [[ "$like" == *" rhel "* || "$like" == *" fedora "* || "$like" == *" centos "* ]] && { command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; }; then
+        DISTRO_FAMILY="rhel"
+        ADMIN_GROUP="wheel"
+        if command -v dnf >/dev/null 2>&1; then
+          PKG_FAMILY="dnf"
+        else
+          PKG_FAMILY="yum"
+        fi
+        WRITE_SUPPORTED=1
+      elif [[ "$like" == *" suse "* || "$like" == *" opensuse "* ]] && command -v zypper >/dev/null 2>&1; then
+        DISTRO_FAMILY="suse"
+        ADMIN_GROUP="wheel"
+        PKG_FAMILY="zypper"
         WRITE_SUPPORTED=1
       else
         DISTRO_FAMILY="unsupported"
@@ -496,6 +549,7 @@ detect_distro() {
         if command -v apt-get >/dev/null 2>&1; then PKG_FAMILY="apt"
         elif command -v dnf >/dev/null 2>&1; then PKG_FAMILY="dnf"
         elif command -v yum >/dev/null 2>&1; then PKG_FAMILY="yum"
+        elif command -v zypper >/dev/null 2>&1; then PKG_FAMILY="zypper"
         else PKG_FAMILY="unknown"; fi
       fi
       ;;
@@ -503,7 +557,7 @@ detect_distro() {
 
   if [[ $WRITE_SUPPORTED -eq 0 ]]; then
     warn "Unsupported distro for write-hardening tasks: ${DISTRO_ID:-unknown} ${DISTRO_VER:-}."
-    warn "Read-only checks can still run. Write-hardening is built for Debian/Ubuntu and RHEL/Fedora/Alma/Rocky only."
+    warn "Read-only checks can still run. Write-hardening is built for Debian/Ubuntu, RHEL/Fedora-family, and SUSE-family systems only."
   fi
   record_action "META" "distro" "${DISTRO_ID}" "${DISTRO_VER}" "${PKG_FAMILY}" "${DISTRO_FAMILY}" "${WRITE_SUPPORTED}"
   log "Detected: ${C_BLD}${DISTRO_ID:-unknown} ${DISTRO_VER}${C_RST} (family: ${DISTRO_FAMILY}, package manager: ${PKG_FAMILY}, admin group: ${ADMIN_GROUP}${DISTRO_LIKE:+, like: ${DISTRO_LIKE}})"
@@ -511,6 +565,7 @@ detect_distro() {
 
 is_debian() { [[ "$DISTRO_FAMILY" == "debian" ]]; }
 is_rhel()   { [[ "$DISTRO_FAMILY" == "rhel" ]]; }
+is_suse()   { [[ "$DISTRO_FAMILY" == "suse" ]]; }
 
 require_supported_write() {
   local task="${1:-${CURRENT_TASK:-this task}}"
@@ -518,7 +573,7 @@ require_supported_write() {
     return 0
   fi
   warn "Unsupported distro for this task: $task. Skipping write-hardening."
-  warn "Detected ${DISTRO_ID:-unknown} ${DISTRO_VER:-}; supported write-hardening distros are Debian/Ubuntu and RHEL/Fedora/Alma/Rocky."
+  warn "Detected ${DISTRO_ID:-unknown} ${DISTRO_VER:-}; supported write-hardening distros are Debian/Ubuntu, RHEL/Fedora-family, and SUSE-family systems."
   return 1
 }
 
@@ -534,7 +589,7 @@ require_systemd_task() {
 pkg_installed() {  # pkg_installed NAME
   case "$PKG_FAMILY" in
     apt) dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed";;
-    dnf|yum) rpm -q "$1" >/dev/null 2>&1;;
+    dnf|yum|zypper) rpm -q "$1" >/dev/null 2>&1;;
     *) return 1;;
   esac
 }
@@ -552,6 +607,9 @@ pkg_available() {
     yum)
       yum -q list available "$p" >/dev/null 2>&1
       ;;
+    zypper)
+      zypper --non-interactive --quiet info "$p" >/dev/null 2>&1
+      ;;
     *)
       return 1
       ;;
@@ -564,6 +622,7 @@ pkg_install() {
     apt) run env DEBIAN_FRONTEND=noninteractive apt-get install -y "$p";;
     dnf) run dnf install -y "$p";;
     yum) run yum install -y "$p";;
+    zypper) run zypper --non-interactive install "$p";;
     *) warn "Unsupported package manager for installing $p"; return 1;;
   esac
 }
@@ -576,6 +635,7 @@ pkg_remove() {
     apt) run env DEBIAN_FRONTEND=noninteractive apt-get purge -y "$p";;
     dnf) run dnf remove -y "$p";;
     yum) run yum remove -y "$p";;
+    zypper) run zypper --non-interactive remove "$p";;
     *) warn "Unsupported package manager for removing $p"; return 1;;
   esac
 }
@@ -598,6 +658,29 @@ pkg_install_tracked() {
   fi
 }
 
+pkg_install_any_tracked() {
+  local p
+  for p in "$@"; do
+    if pkg_installed "$p"; then
+      info "$p already installed."
+      return 0
+    fi
+  done
+  for p in "$@"; do
+    if pkg_available "$p"; then
+      record_action "PKG_INSTALL" "$PKG_FAMILY" "$p"
+      if pkg_install "$p"; then
+        ok "Installed $p"
+        return 0
+      fi
+      warn "Failed to install $p"
+      return 1
+    fi
+  done
+  warn "None of these packages are available from configured repositories for ${DISTRO_ID:-this distro}: $*"
+  return 1
+}
+
 # Run the platform's package upgrade flow. This is intentionally logged as a
 # note rather than a reversible action: package version rollbacks are not safe
 # to automate from this toolkit's backup model.
@@ -614,6 +697,10 @@ pkg_full_upgrade() {
       ;;
     yum)
       run yum update -y
+      ;;
+    zypper)
+      run zypper --non-interactive refresh
+      run zypper --non-interactive update
       ;;
   esac
 }
@@ -1032,9 +1119,9 @@ sec_backup_snapshot() {
 # ============================================================================
 # SECTION 7 — User & Group Audit
 # ============================================================================
-AUTH_USERS=(); AUTH_SUDO=()
+AUTH_USERS=(); AUTH_SUDO=(); AUTH_GROUP_SPECS=()
 parse_authorized() {
-  AUTH_USERS=(); AUTH_SUDO=(); local sec="" line
+  AUTH_USERS=(); AUTH_SUDO=(); AUTH_GROUP_SPECS=(); local sec="" line
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%%#*}"
     line="$(echo "$line" | xargs 2>/dev/null)"
@@ -1042,13 +1129,155 @@ parse_authorized() {
     case "${line,,}" in
       "[users]")   sec="users";   continue;;
       "[sudoers]") sec="sudoers"; continue;;
+      "[groups]")  sec="groups";  continue;;
     esac
     [[ "$sec" == "users"   ]] && AUTH_USERS+=("$line")
     [[ "$sec" == "sudoers" ]] && AUTH_SUDO+=("$line")
+    if [[ "$sec" == "groups" ]]; then
+      if [[ "$line" != *:* ]]; then
+        warn "Invalid [groups] line '$line' (expected: group: user1 user2); skipping."
+        continue
+      fi
+      local group members member
+      group="$(echo "${line%%:*}" | xargs 2>/dev/null)"
+      members="$(echo "${line#*:}" | tr ',' ' ' | xargs 2>/dev/null)"
+      if [[ -z "$group" || -z "$members" ]]; then
+        warn "Invalid [groups] line '$line' (missing group or users); skipping."
+        continue
+      fi
+      for member in $members; do
+        AUTH_GROUP_SPECS+=("${group}:${member}")
+      done
+    fi
   done < "$AUTH_FILE"
 }
 
 in_list() { local x="$1"; shift; local i; for i in "$@"; do [[ "$x" == "$i" ]] && return 0; done; return 1; }
+
+ensure_creds_file() {
+  if [[ ! -s "$CREDS_FILE" ]]; then
+    : > "$CREDS_FILE"
+    chmod 600 "$CREDS_FILE"
+    echo "# Generated by harden.sh on $(date)  -- KEEP SECRET" >> "$CREDS_FILE"
+  fi
+}
+
+ensure_authorized_group_memberships() {
+  local spec group user pu
+  local -A protected_map=()
+  local -A skipped_groups=()
+  local -a protected_users=()
+  mapfile -t protected_users < <(detect_invoking_human_accounts)
+  for pu in "${protected_users[@]}"; do protected_map["$pu"]=1; done
+  if [[ ${#AUTH_GROUP_SPECS[@]} -eq 0 ]]; then
+    info "Authorized group additions: (none)"
+    return 0
+  fi
+  info "Authorized group additions requested: ${AUTH_GROUP_SPECS[*]}"
+  for spec in "${AUTH_GROUP_SPECS[@]}"; do
+    group="${spec%%:*}"
+    user="${spec#*:}"
+    if [[ "$group" == "$ADMIN_GROUP" || "$group" == "sudo" || "$group" == "wheel" ]]; then
+      warn "Ignoring [groups] entry '${group}: ${user}'. Use [sudoers] to authorize admin-group membership."
+      continue
+    fi
+    if ! in_list "$user" "${AUTH_USERS[@]}"; then
+      warn "Ignoring [groups] entry '${group}: ${user}' because '$user' is not listed under [users]."
+      continue
+    fi
+    if [[ -n "${protected_map[$user]:-}" ]]; then
+      warn "Skipping [groups] change for protected invoking/session account '$user'."
+      continue
+    fi
+    if ! getent passwd "$user" >/dev/null 2>&1; then
+      warn "User '$user' listed for group '$group' does not exist; skipping."
+      continue
+    fi
+    if ! getent group "$group" >/dev/null 2>&1; then
+      if [[ -n "${skipped_groups[$group]:-}" ]]; then
+        warn "Group '$group' still does not exist; skipping '$user'."
+        continue
+      fi
+      warn "Group '$group' listed under [groups] does not exist."
+      if [[ ! "$group" =~ ^[A-Za-z_][A-Za-z0-9_.-]*[$]?$ ]]; then
+        warn "Skipping invalid group name '$group'."
+        skipped_groups["$group"]=1
+        continue
+      fi
+      if confirm "Create group '$group' and add listed authorized users to it? Outcome: creates a local group and applies matching [groups] memberships. Risk: wrong groups can grant unintended app/file access or be scored unauthorized"; then
+        record_action "GROUP_CREATE" "$group"
+        if run groupadd "$group"; then
+          ok "Created group $group"
+        else
+          warn "Failed creating group '$group'; skipping matching [groups] memberships."
+          skipped_groups["$group"]=1
+          continue
+        fi
+      else
+        warn "Group '$group' creation declined; skipping matching [groups] memberships."
+        skipped_groups["$group"]=1
+        continue
+      fi
+    fi
+    if id -nG "$user" 2>/dev/null | tr ' ' '\n' | grep -Fxq "$group"; then
+      ok "$user is already a member of $group."
+      continue
+    fi
+    record_action "GROUP_MEMBER_ADD" "$user" "$group"
+    if run gpasswd -a "$user" "$group"; then
+      ok "Added $user to $group"
+    else
+      warn "Failed adding $user to $group"
+    fi
+  done
+}
+
+create_missing_authorized_users() {
+  local missing=() u
+  for u in "${AUTH_USERS[@]}"; do
+    [[ "$u" == "root" ]] && continue
+    getent passwd "$u" >/dev/null 2>&1 || missing+=("$u")
+  done
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    ok "No missing authorized users."
+    return 0
+  fi
+
+  warn "Authorized users listed in $AUTH_FILE but missing from this system: ${missing[*]}"
+  if ! confirm "Create these missing authorized users now? Outcome: creates login accounts with home dirs and generated passwords saved to $CREDS_FILE. Risk: extra accounts can be scored unauthorized if your readme is wrong"; then
+    info "Missing authorized-user creation skipped."
+    return 0
+  fi
+
+  prepare_edit /etc/passwd; prepare_edit /etc/shadow
+  prepare_edit /etc/group;  prepare_edit /etc/gshadow
+  ensure_creds_file
+
+  local shell newpw
+  shell="/bin/bash"
+  [[ -x "$shell" ]] || shell="/bin/sh"
+  for u in "${missing[@]}"; do
+    if [[ ! "$u" =~ ^[A-Za-z_][A-Za-z0-9_.-]*[$]?$ ]]; then
+      warn "Skipping invalid username '$u'."
+      continue
+    fi
+    newpw="$(gen_password)"
+    if run useradd -m -s "$shell" "$u"; then
+      record_action "USER_CREATE" "$u"
+    else
+      warn "Failed creating authorized user $u"
+      continue
+    fi
+    if printf '%s:%s\n' "$u" "$newpw" | chpasswd; then
+      printf '%-20s CREATED NEW=%s\n' "$u" "$newpw" >> "$CREDS_FILE"
+      ok "Created authorized user $u (password saved to $CREDS_FILE)"
+    else
+      warn "Created $u but failed to set the generated password; locking account until manually fixed."
+      run passwd -l "$u" >/dev/null 2>&1 || true
+    fi
+  done
+}
+
 
 sec_user_audit() {
   start_task "user_audit" "User & Group Audit"
@@ -1072,6 +1301,9 @@ sec_user_audit() {
   else
     warn "Could not identify a non-root invoking account; review deletion prompts carefully."
   fi
+
+  # --- Missing authorized users ---
+  create_missing_authorized_users
 
   # --- UID-0 (root-equivalent) accounts other than root ---
   local uid0
@@ -1131,6 +1363,9 @@ sec_user_audit() {
       warn "Failed removing $u from $ADMIN_GROUP"
     fi
   done
+
+  # --- Authorized non-admin group memberships (add-only) ---
+  ensure_authorized_group_memberships
 
   # --- Non-root groups with GID 0 (root-equivalent group) ---
   # The checklist requires that no group other than 'root' carries GID 0.
@@ -1273,7 +1508,7 @@ EOF
     fi
     run systemctl enable --now unattended-upgrades 2>/dev/null
     ok "unattended-upgrades and apt-listchanges configured"
-  else
+  elif is_rhel; then
     [[ $do_upgrade -eq 1 ]] && pkg_full_upgrade
     if [[ "$PKG_FAMILY" == "dnf" ]]; then
       if ! pkg_install_tracked dnf-automatic; then
@@ -1302,6 +1537,46 @@ EOF
       run systemctl enable --now yum-cron
       ok "yum-cron configured (security only)"
     fi
+  elif is_suse; then
+    [[ $do_upgrade -eq 1 ]] && pkg_full_upgrade
+    local zbin svc timer
+    zbin="$(command -v zypper || true)"
+    if [[ -z "$zbin" ]]; then
+      warn "zypper not found; skipping SUSE automatic security patch timer."
+      end_task; return
+    fi
+    svc=/etc/systemd/system/harden-zypper-security.service
+    timer=/etc/systemd/system/harden-zypper-security.timer
+    prepare_edit "$svc"
+    cat > "$svc" <<EOF
+[Unit]
+Description=Apply SUSE security patches with zypper
+Documentation=man:zypper(8)
+
+[Service]
+Type=oneshot
+ExecStart=${zbin} --non-interactive refresh
+ExecStart=${zbin} --non-interactive patch -g security
+EOF
+    prepare_edit "$timer"
+    cat > "$timer" <<'EOF'
+[Unit]
+Description=Daily SUSE security patch check
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=30m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    run systemctl daemon-reload
+    record_action "TIMER" "harden-zypper-security.timer"
+    run systemctl enable --now harden-zypper-security.timer
+    ok "SUSE zypper security-patch timer configured"
+  else
+    warn "Unsupported distro for automatic update configuration; skipped."
   fi
   end_task
 }
@@ -1316,6 +1591,11 @@ sec_passwords() {
   local pwquality_available=0
   if is_debian; then
     pkg_install_tracked libpam-pwquality && pwquality_available=1
+  elif is_suse; then
+    if pkg_install_any_tracked pam_pwquality libpwquality-tools libpwquality; then
+      pam_module_exists pam_pwquality.so && pwquality_available=1
+      [[ $pwquality_available -eq 0 ]] && warn "pwquality package installed, but pam_pwquality.so was not found; PAM enforcement will be skipped."
+    fi
   else
     pkg_install_tracked libpwquality && pwquality_available=1
   fi
@@ -1364,8 +1644,16 @@ sec_passwords() {
       else
         warn "$cp not found; skipped PAM password enforcement."
       fi
+    elif is_suse; then
+      warn "SUSE-family PAM stacks are maintained with pam-config; harden.sh will not hand-edit common-password/common-*-pc."
+      if command -v pam-config >/dev/null 2>&1; then
+        run pam-config --list-modules || true
+        warn "Use pam-config to review/enable pam_pwquality only after testing the exact stack on this image."
+      else
+        warn "pam-config not found; skipped SUSE PAM password-stack enforcement."
+      fi
     else
-      # RHEL/Fedora/Alma/Rocky: authselect-managed PAM files should not be
+      # RHEL/Fedora-family: authselect-managed PAM files should not be
       # hand-edited. The stock profiles normally include pam_pwquality and read
       # /etc/security/pwquality.conf. If a custom profile omits it, surface that
       # as a manual authselect-profile fix instead of guessing.
@@ -1638,8 +1926,7 @@ sec_pwaudit() {
       info "Skipped weak-password resets; no password hashes changed."
     else
       prepare_edit /etc/shadow            # whole-file backup (safety net for revert)
-      : > "$CREDS_FILE"; chmod 600 "$CREDS_FILE"
-      echo "# Generated by harden.sh on $(date)  — KEEP SECRET" >> "$CREDS_FILE"
+      ensure_creds_file
       for u in "${!WEAK[@]}"; do
         local oldpw="${WEAK[$u]}" oldhash="${USERHASH[$u]}" newpw
         newpw="$(gen_password)"
@@ -1677,6 +1964,7 @@ pkg_remove_silent() {
     apt) env DEBIAN_FRONTEND=noninteractive apt-get purge -y "$p" >/dev/null 2>&1;;
     dnf) dnf remove -y "$p" >/dev/null 2>&1;;
     yum) yum remove -y "$p" >/dev/null 2>&1;;
+    zypper) zypper --non-interactive remove "$p" >/dev/null 2>&1;;
     *) return 1;;
   esac
 }
@@ -1787,6 +2075,14 @@ sec_auth_lockout() {
       else
         warn "authselect not found; not hand-editing RHEL-family PAM files."
       fi
+    elif is_suse; then
+      warn "SUSE-family PAM stacks are maintained with pam-config; not enabling pam_faillock automatically."
+      if command -v pam-config >/dev/null 2>&1; then
+        run pam-config --list-modules || true
+        warn "Review pam-config support and test TTY/GUI/sudo from a root/rescue shell before enabling faillock manually."
+      else
+        warn "pam-config not found; skipped SUSE faillock configuration."
+      fi
     else
       warn "No supported method to configure faillock on this system; skipped."
     fi
@@ -1798,7 +2094,9 @@ sec_auth_lockout() {
   # (passwd -u). Console/single-user root via sulogin may also be affected, so
   # ensure at least one sudo-capable account works before logging out.
   local root_state; root_state="$(passwd -S root 2>/dev/null | awk '{print $2}')"
-  if [[ "$root_state" == "L" ]]; then
+  if [[ ${#protected_users[@]} -eq 0 && "$(id -un 2>/dev/null || true)" == "root" ]]; then
+    warn "Running from a root shell with no non-root invoking account detected; skipping root password lock because root is the current operator account."
+  elif [[ "$root_state" == "L" ]]; then
     ok "root account password is already locked."
   elif ask_risky "Lock the root account password (passwd -l root). Ensure a sudo-capable user works first; revert.sh can unlock it"; then
     record_action "USER_LOCK" "root"
@@ -1849,12 +2147,220 @@ restart_sshd_safe() {
   fi
 }
 
+sshd_effective_value() {
+  local key="${1,,}"
+  sshd -T -f "$SSHD_CONFIG" 2>/dev/null | awk -v key="$key" '$1 == key {print $2; exit}'
+}
+
+ssh_user_home() {
+  getent passwd "$1" 2>/dev/null | awk -F: '{print $6}'
+}
+
+ssh_authorized_keys_file() {
+  local home
+  home="$(ssh_user_home "$1")"
+  [[ -n "$home" ]] && printf '%s/.ssh/authorized_keys\n' "$home"
+}
+
+ssh_user_has_authorized_key() {
+  local ak
+  ak="$(ssh_authorized_keys_file "$1")"
+  [[ -f "$ak" ]] || return 1
+  grep -Eq '^[[:space:]]*(sk-ssh-ed25519|sk-ecdsa-sha2-nistp256|ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|rsa-sha2-512|rsa-sha2-256|ssh-rsa)[[:space:]]+' "$ak"
+}
+
+ssh_audit_user_authorized_keys() {
+  local user="$1" home sshdir ak key_count
+  home="$(ssh_user_home "$user")"
+  if [[ -z "$home" ]]; then
+    warn "SSH key audit: user '$user' does not exist."
+    return 1
+  fi
+  sshdir="$home/.ssh"
+  ak="$sshdir/authorized_keys"
+  info "SSH key audit for $user:"
+  if [[ -d "$home" ]]; then
+    info "home: $home ($(stat -c '%a %U:%G' "$home" 2>/dev/null || echo 'permissions unknown'))"
+  else
+    warn "home directory missing: $home"
+  fi
+  if [[ -d "$sshdir" ]]; then
+    info ".ssh: $sshdir ($(stat -c '%a %U:%G' "$sshdir" 2>/dev/null || echo 'permissions unknown'))"
+  else
+    warn ".ssh directory missing: $sshdir"
+  fi
+  if [[ -f "$ak" ]]; then
+    key_count="$(grep -Ec '^[[:space:]]*(sk-ssh-ed25519|sk-ecdsa-sha2-nistp256|ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|rsa-sha2-512|rsa-sha2-256|ssh-rsa)[[:space:]]+' "$ak" 2>/dev/null || echo 0)"
+    info "authorized_keys: $ak ($(stat -c '%a %U:%G' "$ak" 2>/dev/null || echo 'permissions unknown'), valid-looking keys: $key_count)"
+    [[ "$key_count" -gt 0 ]] && return 0
+  else
+    warn "authorized_keys missing: $ak"
+  fi
+  return 1
+}
+
+ssh_repair_authorized_key_permissions() {
+  local user="$1" home sshdir ak group
+  home="$(ssh_user_home "$user")"
+  [[ -n "$home" && -d "$home" ]] || return 1
+  sshdir="$home/.ssh"
+  ak="$sshdir/authorized_keys"
+  group="$(id -gn "$user" 2>/dev/null || echo "$user")"
+  if [[ -d "$sshdir" ]]; then record_perm "$sshdir"; else mkdir -p "$sshdir"; fi
+  run chown "$user:$group" "$sshdir"
+  run chmod 700 "$sshdir"
+  [[ -e "$ak" ]] && record_perm "$ak"
+  run chown "$user:$group" "$ak"
+  run chmod 600 "$ak"
+}
+
+ssh_generate_key_for_user() {
+  local user="$1" home sshdir ak group keydir priv pub comment publine sshdir_existed=0 ak_existed=0
+  if ! command -v ssh-keygen >/dev/null 2>&1; then
+    warn "ssh-keygen not found; cannot generate an SSH key."
+    return 1
+  fi
+  home="$(ssh_user_home "$user")"
+  if [[ -z "$home" || ! -d "$home" ]]; then
+    warn "Cannot generate SSH key for $user because its home directory is missing."
+    return 1
+  fi
+  sshdir="$home/.ssh"
+  ak="$sshdir/authorized_keys"
+  [[ -d "$sshdir" ]] && sshdir_existed=1
+  [[ -e "$ak" ]] && ak_existed=1
+  group="$(id -gn "$user" 2>/dev/null || echo "$user")"
+  keydir="$RUN_DIR/ssh-keys"
+  mkdir -p "$keydir"
+  chmod 700 "$keydir"
+  priv="$keydir/${user}_ed25519"
+  pub="$priv.pub"
+  comment="harden-${user}@$(hostname 2>/dev/null || echo linux)-${TS}"
+  if run ssh-keygen -q -t ed25519 -N "" -C "$comment" -f "$priv"; then
+    chmod 600 "$priv"
+    chmod 644 "$pub"
+  else
+    warn "ssh-keygen failed for $user."
+    return 1
+  fi
+  prepare_edit "$ak"
+  [[ $sshdir_existed -eq 1 ]] && record_perm "$sshdir"
+  [[ $ak_existed -eq 1 ]] && record_perm "$ak"
+  [[ -d "$sshdir" ]] || mkdir -p "$sshdir"
+  [[ -e "$ak" ]] || : > "$ak"
+  publine="$(sed -n '1p' "$pub")"
+  grep -Fxq "$publine" "$ak" 2>/dev/null || printf '%s\n' "$publine" >> "$ak"
+  chown "$user:$group" "$sshdir" "$ak"
+  chmod 700 "$sshdir"
+  chmod 600 "$ak"
+  ok "Generated SSH key for $user and installed its public key in $ak"
+  info "Public key: $publine"
+  warn "Private key saved root-only at $priv. Copy it securely to your SSH client."
+  if confirm "Display the generated PRIVATE key now? Outcome: you can copy it into an SSH client. Risk: it will also be saved in this transcript at $OUTPUT_LOG"; then
+    sed 's/^/    /' "$priv"
+  fi
+}
+
+ensure_operator_ssh_key() {
+  local user="$1"
+  if [[ -z "$user" ]]; then
+    warn "No protected invoking/session account detected; refusing to prepare key-only SSH."
+    return 1
+  fi
+  if ssh_audit_user_authorized_keys "$user"; then
+    ssh_repair_authorized_key_permissions "$user"
+    ok "$user has at least one valid-looking SSH public key."
+    return 0
+  fi
+  if confirm "Generate and install an ed25519 SSH key for $user? Outcome: public key is added to authorized_keys and private key is saved under $RUN_DIR. Risk: generated private key must be copied securely before relying on key-only SSH"; then
+    ssh_generate_key_for_user "$user"
+  else
+    warn "No usable SSH key was confirmed for $user."
+    return 1
+  fi
+}
+
+configure_ssh_authentication_mode() {
+  local -a protected_users=("$@")
+  local operator="${protected_users[0]:-}"
+  local pass kbd pubkey choice
+  pass="$(sshd_effective_value PasswordAuthentication)"; pass="${pass:-unknown}"
+  kbd="$(sshd_effective_value KbdInteractiveAuthentication)"; kbd="${kbd:-unknown}"
+  pubkey="$(sshd_effective_value PubkeyAuthentication)"; pubkey="${pubkey:-unknown}"
+  info "Current SSH auth audit: PubkeyAuthentication=$pubkey PasswordAuthentication=$pass KbdInteractiveAuthentication=$kbd"
+  if [[ -n "$operator" ]]; then
+    ssh_audit_user_authorized_keys "$operator" || true
+  else
+    warn "No current non-root operator account detected for SSH key audit."
+  fi
+
+  echo "    SSH authentication options:"
+  echo "      1) Key-only login: enable keys, disable password and keyboard-interactive auth"
+  echo "      2) Key + password login: enable both key and password auth"
+  echo "      3) Password-only login: enable password auth and disable key auth"
+  echo "      4) Audit key login only; leave password-auth setting intact"
+  echo "      5) Audit password-auth setting only; leave key setting intact"
+  echo "      6) Do nothing"
+  read -r -p "    Choose SSH authentication behavior [6]: " choice
+  choice="${choice:-6}"
+
+  case "$choice" in
+    1)
+      if ensure_operator_ssh_key "$operator"; then
+        set_ssh PubkeyAuthentication yes
+        set_ssh AuthorizedKeysFile ".ssh/authorized_keys"
+        set_ssh PasswordAuthentication no
+        set_ssh KbdInteractiveAuthentication no
+        ok "SSH authentication set to key-only."
+      else
+        warn "Key-only SSH skipped; password-login settings left intact."
+      fi
+      ;;
+    2)
+      if [[ -n "$operator" ]] && ! ssh_user_has_authorized_key "$operator"; then
+        ensure_operator_ssh_key "$operator" || warn "Continuing with password auth enabled; key login may not be usable for $operator."
+      elif [[ -n "$operator" ]]; then
+        ssh_repair_authorized_key_permissions "$operator"
+      fi
+      set_ssh PubkeyAuthentication yes
+      set_ssh AuthorizedKeysFile ".ssh/authorized_keys"
+      set_ssh PasswordAuthentication yes
+      set_ssh KbdInteractiveAuthentication yes
+      ok "SSH authentication set to allow both key and password login."
+      ;;
+    3)
+      set_ssh PasswordAuthentication yes
+      set_ssh KbdInteractiveAuthentication yes
+      set_ssh PubkeyAuthentication no
+      ok "SSH authentication set to password-only."
+      ;;
+    4)
+      if [[ -n "$operator" ]]; then
+        ssh_audit_user_authorized_keys "$operator" || true
+      else
+        warn "No current non-root operator account detected for key audit."
+      fi
+      ;;
+    5)
+      info "Password-auth audit only: PasswordAuthentication=$pass KbdInteractiveAuthentication=$kbd"
+      ;;
+    6)
+      info "SSH authentication mode left unchanged."
+      ;;
+    *)
+      warn "Invalid SSH auth option '$choice'; leaving authentication mode unchanged."
+      ;;
+  esac
+}
+
 sec_ssh() {
   start_task "ssh" "SSH Hardening"
   require_supported_write "SSH Hardening" || { end_task; return; }
   require_systemd_task "SSH Hardening" || { end_task; return; }
   if [[ ! -f "$SSHD_CONFIG" ]]; then warn "$SSHD_CONFIG not found; is OpenSSH installed?"; end_task; return; fi
   prepare_edit "$SSHD_CONFIG"
+  local -a protected_users=()
+  mapfile -t protected_users < <(detect_invoking_human_accounts)
 
   # --- safe, non-disruptive directives ---
   log "Applying baseline SSH hardening"
@@ -1875,24 +2381,8 @@ sec_ssh() {
   # NOTE: 'Protocol 2' is intentionally NOT written — it is removed/deprecated
   # on OpenSSH >= 7.6 and would make 'sshd -t' fail. Protocol 1 no longer exists.
 
-  # --- key presence check (informs the password-auth decision) ---
-  local have_keys=0
-  if grep -rqs . /home/*/.ssh/authorized_keys /root/.ssh/authorized_keys 2>/dev/null; then
-    have_keys=1
-    info "Existing authorized_keys detected."
-  else
-    warn "No SSH authorized_keys found on the system."
-  fi
-
-  # --- RISKY: disable password authentication ---
-  if [[ $have_keys -eq 1 ]]; then
-    if ask_risky "Disable SSH password authentication (PasswordAuthentication no). Keys WERE detected, but verify YOUR account has a working key first"; then
-      set_ssh PasswordAuthentication no
-      set_ssh KbdInteractiveAuthentication no
-    fi
-  else
-    warn "Skipping 'PasswordAuthentication no' automatically — no keys exist (would lock everyone out)."
-  fi
+  # --- authentication mode selection ---
+  configure_ssh_authentication_mode "${protected_users[@]}"
 
   # --- RISKY: change SSH port to 2222 ---
   if ask_risky "Change SSH port from 22 to 2222 (firewall + any external configs must match; may lose points if scoring expects 22)"; then
@@ -1903,9 +2393,38 @@ sec_ssh() {
 
   # --- RISKY: restrict to an admin group ---
   if ask_risky "Restrict SSH logins to members of group 'sshusers' (AllowGroups sshusers). Users not added to this group lose SSH access"; then
-    if ! getent group sshusers >/dev/null; then
-      record_action "GROUP_CREATE" "sshusers"
-      run groupadd sshusers
+    local pu protected_missing=0 sshusers_exists=0
+    local -a protected_to_add=()
+    getent group sshusers >/dev/null && sshusers_exists=1
+    if [[ ${#protected_users[@]} -eq 0 ]]; then
+      warn "No protected invoking/session account detected; skipping AllowGroups sshusers to avoid blocking the current operator."
+      restart_sshd_safe; end_task; return
+    fi
+    for pu in "${protected_users[@]}"; do
+      if [[ $sshusers_exists -eq 0 ]] || ! id -nG "$pu" 2>/dev/null | tr ' ' '\n' | grep -qx sshusers; then
+        protected_to_add+=("$pu")
+      fi
+    done
+    if [[ ${#protected_to_add[@]} -gt 0 ]]; then
+      warn "Protected invoking/session account(s) not in sshusers: ${protected_to_add[*]}"
+      if confirm "Add protected account(s) to sshusers before enabling AllowGroups? Outcome: preserves SSH access for the current operator. Risk: modifies current user group membership and may require a new login for local shells to show it"; then
+        if [[ $sshusers_exists -eq 0 ]]; then
+          record_action "GROUP_CREATE" "sshusers"
+          run groupadd sshusers && sshusers_exists=1 || protected_missing=1
+        fi
+        if [[ $sshusers_exists -eq 1 ]]; then
+          for pu in "${protected_to_add[@]}"; do
+            record_action "GROUP_MEMBER_ADD" "$pu" "sshusers"
+            run usermod -aG sshusers "$pu" || protected_missing=1
+          done
+        fi
+      else
+        protected_missing=1
+      fi
+    fi
+    if [[ $protected_missing -eq 1 ]]; then
+      warn "Skipping AllowGroups sshusers because protected operator account(s) were not added to sshusers; this avoids blocking current SSH access."
+      restart_sshd_safe; end_task; return
     fi
     # add authorized sudoers (best-effort) so they keep access
     if [[ -r "$AUTH_FILE" ]]; then
@@ -1913,6 +2432,10 @@ sec_ssh() {
       local u
       for u in "${AUTH_SUDO[@]}"; do
         getent passwd "$u" >/dev/null || continue
+        if in_list "$u" "${protected_users[@]}"; then
+          warn "Skipping sshusers group change for protected invoking/session account '$u'."
+          continue
+        fi
         if ! id -nG "$u" | tr ' ' '\n' | grep -qx sshusers; then
           record_action "GROUP_MEMBER_ADD" "$u" "sshusers"
           run usermod -aG sshusers "$u"
@@ -1928,7 +2451,7 @@ sec_ssh() {
 }
 
 # ============================================================================
-# SECTION 13 — Firewall (UFW on Debian, firewalld on RHEL)
+# SECTION 13 — Firewall (UFW on Debian, firewalld on RHEL/SUSE)
 # ============================================================================
 SSH_PORT_CHANGED=""
 sec_firewall() {
@@ -1975,7 +2498,7 @@ sec_firewall() {
     fi
     run ufw status verbose
 
-  elif is_rhel; then
+  elif is_rhel || is_suse; then
     pkg_install_tracked firewalld
     # back up zone configs
     [[ -d /etc/firewalld ]] && { mkdir -p "$BACKUP_DIR/files/etc"; cp -a /etc/firewalld "$BACKUP_DIR/files/etc/" 2>/dev/null; record_action "FIREWALLD_BACKUP" "/etc/firewalld" "$BACKUP_DIR/files/etc/firewalld"; }
@@ -2204,10 +2727,16 @@ secure_vsftpd_config() {
 
 apache_config_path() {
   local f
-  for f in /etc/apache2/apache2.conf /etc/httpd/conf/httpd.conf; do
+  for f in /etc/apache2/apache2.conf /etc/apache2/httpd.conf /etc/httpd/conf/httpd.conf; do
     [[ -f "$f" ]] && { echo "$f"; return 0; }
   done
-  is_debian && echo /etc/apache2/apache2.conf || echo /etc/httpd/conf/httpd.conf
+  if is_debian; then
+    echo /etc/apache2/apache2.conf
+  elif is_suse; then
+    echo /etc/apache2/httpd.conf
+  else
+    echo /etc/httpd/conf/httpd.conf
+  fi
 }
 
 apache_service_name() {
@@ -2229,7 +2758,7 @@ validate_apache_config() {
 secure_apache_config() {
   if ! pkg_installed apache2 && ! pkg_installed httpd && ! pkg_installed apache && \
      ! command -v apache2ctl >/dev/null 2>&1 && ! command -v httpd >/dev/null 2>&1 && \
-     [[ ! -f /etc/apache2/apache2.conf && ! -f /etc/httpd/conf/httpd.conf ]]; then
+     [[ ! -f /etc/apache2/apache2.conf && ! -f /etc/apache2/httpd.conf && ! -f /etc/httpd/conf/httpd.conf ]]; then
     ok "Apache/httpd not detected; Apache hardening skipped."
     return 0
   fi
@@ -2257,16 +2786,34 @@ secure_apache_modsecurity() {
     return 0
   fi
 
-  local pkg c svc
-  if is_debian; then pkg="libapache2-mod-security2"; else pkg="mod_security"; fi
-  if ! pkg_install_tracked "$pkg"; then
-    warn "$pkg unavailable; ModSecurity setup skipped."
-    return 0
+  local c svc
+  if is_debian; then
+    if ! pkg_install_tracked libapache2-mod-security2; then
+      warn "libapache2-mod-security2 unavailable; ModSecurity setup skipped."
+      return 0
+    fi
+  elif is_suse; then
+    if ! pkg_install_any_tracked apache2-mod_security2 mod_security2 mod_security; then
+      warn "SUSE ModSecurity package unavailable; ModSecurity setup skipped."
+      return 0
+    fi
+  else
+    if ! pkg_install_tracked mod_security; then
+      warn "mod_security unavailable; ModSecurity setup skipped."
+      return 0
+    fi
   fi
 
-  if is_debian && command -v a2enmod >/dev/null 2>&1; then
+  if { is_debian || is_suse; } && command -v a2enmod >/dev/null 2>&1; then
     run a2enmod security2
     record_action "NOTE" "apache_modsecurity_module_enabled"
+  elif is_suse; then
+    warn "a2enmod not found; relying on SUSE Apache module packaging/config includes."
+  fi
+
+  if is_suse && [[ ! -d /etc/apache2/conf.d ]]; then
+    warn "/etc/apache2/conf.d not found; ModSecurity setup skipped."
+    return 0
   fi
 
   if is_debian; then
@@ -2288,6 +2835,15 @@ secure_apache_modsecurity() {
         echo "</IfModule>"
       } > "$c"
     fi
+  elif is_suse; then
+    c=/etc/apache2/conf.d/99-modsecurity-detectiononly.conf
+    prepare_edit "$c"
+    {
+      echo "# Managed by harden.sh"
+      echo "<IfModule security2_module>"
+      echo "    SecRuleEngine DetectionOnly"
+      echo "</IfModule>"
+    } > "$c"
   else
     c=/etc/httpd/conf.d/99-modsecurity-detectiononly.conf
     prepare_edit "$c"
@@ -2477,6 +3033,7 @@ secure_apache_extra_config() {
   [[ $disable_indexes -eq 0 && $headers -eq 0 ]] && { info "Extra Apache hardening skipped."; return 0; }
 
   if is_debian; then c=/etc/apache2/conf-enabled/99-harden-security.conf
+  elif is_suse; then c=/etc/apache2/conf.d/99-harden-security.conf
   else c=/etc/httpd/conf.d/99-harden-security.conf; fi
   prepare_edit "$c"
   {
@@ -2493,7 +3050,7 @@ secure_apache_extra_config() {
     fi
   } > "$c"
 
-  if [[ $headers -eq 1 ]] && is_debian && command -v a2enmod >/dev/null 2>&1; then
+  if [[ $headers -eq 1 ]] && { is_debian || is_suse; } && command -v a2enmod >/dev/null 2>&1; then
     run a2enmod headers
     record_action "NOTE" "apache_headers_module_enabled"
   fi
@@ -3227,7 +3784,7 @@ sec_fail2ban() {
   local banaction="iptables-multiport"
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
     banaction="ufw"
-  elif is_rhel && systemctl is-active firewalld >/dev/null 2>&1; then
+  elif { is_rhel || is_suse; } && systemctl is-active firewalld >/dev/null 2>&1; then
     banaction="firewallcmd-ipset"
   fi
 
