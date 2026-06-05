@@ -235,6 +235,11 @@ set_ssh() {
   fi
 }
 
+pam_module_exists() {
+  local module="$1"
+  find /lib /usr/lib /usr/lib64 -path "*/security/${module}" -print -quit 2>/dev/null | grep -q .
+}
+
 # ----------------------------------------------------------------------------
 # Prompts
 # ----------------------------------------------------------------------------
@@ -685,7 +690,8 @@ sec_web_sweep() {
 # ============================================================================
 sec_forensics() {
   start_task "forensics" "Forensic / Persistence Checks (read-only)"
-  local wl u out
+  local wl u out mp authlog count
+  local -a scan_roots=() recent_roots=()
   log "Listening sockets:";                 run ss -tulpen
   log "All active TCP/UDP connections:";    run ss -tunap
   if command -v lsof >/dev/null 2>&1; then
@@ -710,6 +716,50 @@ sec_forensics() {
   done < /etc/passwd >> "$OUTPUT_LOG" 2>&1
   log "Executable files in tmp/home dirs:";  find /tmp /var/tmp /dev/shm /home /root -type f -perm /111 -ls >> "$OUTPUT_LOG" 2>&1
   log "Hidden files in tmp/home dirs:";       find /tmp /var/tmp /dev/shm /home /root -type f -name '.*' -ls >> "$OUTPUT_LOG" 2>&1
+  log "World-writable files on local filesystems (first 200):"
+  while IFS= read -r mp; do
+    find "$mp" -xdev -type f -perm -0002 -ls 2>/dev/null
+  done < <(df --local -P 2>/dev/null | awk 'NR>1 {print $6}') | head -200
+  log "World-writable directories missing sticky bit on local filesystems (first 200):"
+  while IFS= read -r mp; do
+    find "$mp" -xdev -type d -perm -0002 ! -perm -1000 -ls 2>/dev/null
+  done < <(df --local -P 2>/dev/null | awk 'NR>1 {print $6}') | head -200
+  log "Files/directories with no owning user or group on local filesystems (first 200):"
+  while IFS= read -r mp; do
+    find "$mp" -xdev \( -nouser -o -nogroup \) -ls 2>/dev/null
+  done < <(df --local -P 2>/dev/null | awk 'NR>1 {print $6}') | head -200
+  log "Script/archive/package files under /home and /root (first 200):"
+  find /home /root -xdev -type f \( -iname '*.sh' -o -iname '*.bash' -o -iname '*.py' \
+    -o -iname '*.pl' -o -iname '*.php' -o -iname '*.cgi' -o -iname '*.deb' \
+    -o -iname '*.rpm' -o -iname '*.zip' -o -iname '*.tgz' -o -iname '*.tar.gz' \) \
+    -printf '%TY-%Tm-%Td %TH:%TM %m %u:%g %p\n' 2>/dev/null | sort | head -200
+  for mp in /etc /usr/local /var/www /srv/www /srv/http /home /root /tmp /var/tmp /dev/shm; do
+    [[ -d "$mp" ]] && recent_roots+=("$mp")
+  done
+  if [[ ${#recent_roots[@]} -gt 0 ]]; then
+    log "Recently changed files in sensitive trees (ctime <= 7 days, first 200):"
+    find "${recent_roots[@]}" -xdev -type f -ctime -7 \
+      -printf '%TY-%Tm-%Td %TH:%TM %m %u:%g %p\n' 2>/dev/null | sort | head -200
+  fi
+  for mp in /var/www /srv/www /srv/http /home /root /tmp /var/tmp /dev/shm; do
+    [[ -d "$mp" ]] && scan_roots+=("$mp")
+  done
+  if [[ ${#scan_roots[@]} -gt 0 ]]; then
+    log "Suspicious long base64-like strings in web/script files (first 200):"
+    grep -RInE --include='*.php' --include='*.phtml' --include='*.phar' \
+      --include='*.inc' --include='*.js' --include='*.sh' --include='*.py' \
+      --include='*.pl' --include='*.cgi' '[A-Za-z0-9+/]{120,}={0,2}' \
+      "${scan_roots[@]}" 2>/dev/null | head -200 || true
+  fi
+  if command -v findmnt >/dev/null 2>&1; then
+    log "Mount options for temp/shared-memory paths:"
+    run findmnt -no TARGET,OPTIONS /tmp /var/tmp /dev/shm /run/shm 2>/dev/null || true
+  fi
+  for authlog in /var/log/auth.log /var/log/secure; do
+    [[ -f "$authlog" ]] || continue
+    count=$(grep -Eci 'Failed password|authentication failure|Invalid user' "$authlog" 2>/dev/null || true)
+    info "$authlog failed-login style events: ${count:-0}"
+  done
   log "SSH .ssh directories (persistence check):"
   find /root /home -name ".ssh" -type d -exec ls -ld {} \; >> "$OUTPUT_LOG" 2>&1
   log "SSH authorized_keys across users:";    find /root /home -name authorized_keys -exec ls -l {} \; -exec cat {} \; >> "$OUTPUT_LOG" 2>&1
@@ -1495,6 +1545,26 @@ sec_auth_lockout() {
       err "Failed to lock root"
     fi
   fi
+
+  # --- RISKY: restrict su to the distro's admin group ---
+  local su_pam="/etc/pam.d/su"
+  if [[ -f "$su_pam" ]]; then
+    if ! pam_module_exists pam_wheel.so; then
+      warn "pam_wheel.so not found; cannot safely configure su restriction on this install."
+    elif grep -Eq "^[[:space:]]*auth[[:space:]]+required[[:space:]]+pam_wheel\\.so.*group=${ADMIN_GROUP}([[:space:]]|$)" "$su_pam"; then
+      ok "su is already restricted to ${ADMIN_GROUP} via pam_wheel."
+    elif ask_risky "Restrict 'su' to members of ${ADMIN_GROUP} via pam_wheel. Outcome: non-admin users cannot su to root. Risk: breaks workflows that rely on su from non-admin accounts; verify sudo/admin access first"; then
+      prepare_edit "$su_pam"
+      if grep -Eq '^[[:space:]]*#?[[:space:]]*auth[[:space:]]+required[[:space:]]+pam_wheel\.so' "$su_pam"; then
+        sed -i -E "s|^[[:space:]]*#?[[:space:]]*auth[[:space:]]+required[[:space:]]+pam_wheel\\.so.*|auth required pam_wheel.so use_uid group=${ADMIN_GROUP}|" "$su_pam"
+      else
+        printf '%s\n' "auth required pam_wheel.so use_uid group=${ADMIN_GROUP}" >> "$su_pam"
+      fi
+      ok "su restricted to ${ADMIN_GROUP} in $su_pam"
+    fi
+  else
+    warn "$su_pam not found; su restriction skipped."
+  fi
   end_task
 }
 
@@ -1680,13 +1750,18 @@ sec_kernel() {
   log "Writing $f"
   cat > "$f" <<'EOF'
 # Managed by harden.sh
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
 fs.protected_fifos = 2
 fs.protected_regular = 2
 fs.suid_dumpable = 0
 kernel.core_uses_pid = 1
 kernel.dmesg_restrict = 1
+kernel.kptr_restrict = 2
+kernel.perf_event_paranoid = 2
 kernel.sysrq = 0
 kernel.randomize_va_space = 2
+kernel.yama.ptrace_scope = 1
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.all.log_martians = 1
@@ -1908,6 +1983,65 @@ secure_apache_config() {
   else
     restore_task_backup "$c"
     warn "Restored previous Apache config; Apache hardening skipped."
+  fi
+}
+
+secure_apache_modsecurity() {
+  if ! pkg_installed apache2 && ! pkg_installed httpd && ! command -v apache2ctl >/dev/null 2>&1 && ! command -v httpd >/dev/null 2>&1; then
+    ok "Apache/httpd not detected; ModSecurity setup skipped."
+    return 0
+  fi
+
+  local pkg c svc
+  if is_debian; then pkg="libapache2-mod-security2"; else pkg="mod_security"; fi
+  if ! pkg_install_tracked "$pkg"; then
+    warn "$pkg unavailable; ModSecurity setup skipped."
+    return 0
+  fi
+
+  if is_debian && command -v a2enmod >/dev/null 2>&1; then
+    run a2enmod security2
+    record_action "NOTE" "apache_modsecurity_module_enabled"
+  fi
+
+  if is_debian; then
+    if [[ ! -f /etc/modsecurity/modsecurity.conf && -f /etc/modsecurity/modsecurity.conf-recommended ]]; then
+      prepare_edit /etc/modsecurity/modsecurity.conf
+      run cp -a /etc/modsecurity/modsecurity.conf-recommended /etc/modsecurity/modsecurity.conf
+    fi
+    if [[ -f /etc/modsecurity/modsecurity.conf ]]; then
+      c=/etc/modsecurity/modsecurity.conf
+      prepare_edit "$c"
+      set_conf_kv "$c" SecRuleEngine DetectionOnly " "
+    else
+      c=/etc/apache2/conf-enabled/99-modsecurity-detectiononly.conf
+      prepare_edit "$c"
+      {
+        echo "# Managed by harden.sh"
+        echo "<IfModule security2_module>"
+        echo "    SecRuleEngine DetectionOnly"
+        echo "</IfModule>"
+      } > "$c"
+    fi
+  else
+    c=/etc/httpd/conf.d/99-modsecurity-detectiononly.conf
+    prepare_edit "$c"
+    {
+      echo "# Managed by harden.sh"
+      echo "<IfModule security2_module>"
+      echo "    SecRuleEngine DetectionOnly"
+      echo "</IfModule>"
+    } > "$c"
+  fi
+
+  if validate_apache_config; then
+    svc="$(apache_service_name)"
+    restart_service_if_present "$svc" || { err "$svc restart failed; restoring ModSecurity config."; restore_task_backup "$c"; restart_service_untracked_if_present "$svc"; return 1; }
+    ok "ModSecurity enabled/requested in DetectionOnly mode"
+  else
+    err "Apache validation failed after ModSecurity setup; restoring staged config."
+    restore_task_backup "$c"
+    validate_apache_config || true
   fi
 }
 
@@ -2200,25 +2334,39 @@ sec_services() {
   require_systemd_task "Unwanted Services & Packages" || { end_task; return; }
 
   # MEGA-BAD: offensive/cracking/exploitation tools and dual-use attack suites.
-  local mega_bad_tokens=(aircrack-ng beef beef-xss ettercap ettercap-common ettercap-graphical \
-    hashcat hydra john kismet medusa metasploit metasploit-framework msfvenom nikto nmap \
-    ophcrack proxychains proxychains4 reaver set setoolkit sqlmap truecrack zenmap)
+  local mega_bad_tokens=(aircrack-ng airmon-ng beef beef-xss burp-suite burpsuite \
+    ettercap ettercap-common ettercap-graphical fcrackzip hashcat hydra hydra-gtk \
+    irpas ipscan john john-data johnny kismet lcrack logkeys maltego medusa \
+    metasploit metasploit-framework msfvenom nessus nikto nmap oclhashcat ophcrack \
+    ophcrack-cli pdfcrack proxychains proxychains4 pyrit rarcrack reaver sbd set \
+    setoolkit sipcrack sqlmap truecrack yersinia zaproxy zenmap)
   # BAD: insecure remote-access daemons, reverse-shell helpers, sniffers, and P2P/games.
   local bad_tokens=(cryptcat netcat netcat-openbsd netcat-traditional ncat socat tcpdump \
-    nc rlogind rshd rcmd rexecd rbootd rquotad rstatd rusersd rwalld rexd \
-    telnet telnetd telnetd-ssl inetutils-telnetd inetutils-inetd \
+    nc pnetcat sock socket rlogind rshd rcmd rexecd rbootd rquotad rstatd rusersd rwalld rexd \
+    telnet telnetd telnetd-ssl inetd openbsd-inetd xinetd \
+    inetutils-ftp inetutils-ftpd inetutils-inetd inetutils-syslogd \
+    inetutils-talk inetutils-talkd inetutils-telnet inetutils-telnetd \
     rsh-server rsh rsh-client rsh-redone-server rsh-redone-client rlinetd \
-    tightvncserver x11vnc tigervnc-server \
+    tightvnc tightvnc-common tightvncserver vncserver x11vnc tigervnc-server xrdp \
     vsftpd proftpd-basic proftpd pure-ftpd ftp tnftp sftpd tftpd-hpa tftp-server tftpd atftpd \
-    nfs-common nfs-kernel-server nfs-utils nis ypbind ypserv \
+    autofs nfs-common nfs-kernel-server nfs-utils nis portmap rpcbind ypbind ypserv \
     snmpd net-snmp talkd ntalk talk pop3 \
     dovecot-pop3d courier-pop \
-    wireshark wireshark-common wireshark-qt tor torbrowser-launcher vuze frostwire freeciv \
-    minetest minetest-server finger fingerd)
+    vnc4server vncsnapshot vtgrab wireshark wireshark-common wireshark-qt tor \
+    torbrowser-launcher deluge vuze frostwire aisleriot five-or-more four-in-a-row \
+    freeciv gnome-2048 gnome-chess gnome-games gnome-klotski gnome-mahjongg \
+    gnome-mines gnome-nibbles gnome-robots gnome-sudoku gnome-taquin gnome-tetravex \
+    hitori iagno lightsoff minetest minetest-server pegsolitaire quadrapassel sl \
+    swell-foop tali wesnoth finger fingerd whoopsie \
+    zeitgeist zeitgeist-core zeitgeist-datahub python-zeitgeist rhythmbox-plugin-zeitgeist)
   # POSSIBLY-BAD: legitimate services that may be required by the readme.
-  local maybe_tokens=(samba postgresql postgresql-server apache apache2 httpd nginx lighttpd \
-    mysql-server mariadb-server php php-fpm libapache2-mod-php bind9 named \
-    dovecot-core dovecot-imapd sendmail postfix exim4 snmp)
+  local maybe_tokens=(samba samba-common samba-common-bin samba4 postgresql postgresql-server \
+    apache apache2 httpd nginx nginx-common lighttpd mysql mysql-client-5.5 mysql-client-5.6 \
+    mysql-client-core-5.5 mysql-client-core-5.6 mysql-common-5.5 mysql-common-5.6 \
+    mysql-server mysql-server-5.5 mysql-server-5.6 mysql-server-core-5.6 \
+    mariadb-server php php-fpm libapache2-mod-php bind bind9 named \
+    dovecot-core dovecot-imapd sendmail postfix exim4 snmp dnsmasq unbound \
+    tomcat tomcat6 tomcat7 tomcat8 tomcat9 tomcat10 php5)
 
   local installed_mega=() installed_bad=() installed_maybe=() t
   for t in "${mega_bad_tokens[@]}"; do pkg_installed "$t" && installed_mega+=("$t"); done
@@ -2238,7 +2386,8 @@ sec_services() {
   # may depend on PHP and a database. Offer to protect these from removal here;
   # they should be SECURED instead (see Service Config section).
   local web_stack=(apache apache2 httpd nginx lighttpd php php-fpm libapache2-mod-php \
-    mysql-server mariadb-server postgresql postgresql-server bind9 named unbound dnsmasq)
+    mysql-server mariadb-server postgresql postgresql-server bind9 named unbound dnsmasq \
+    tomcat tomcat6 tomcat7 tomcat8 tomcat9 tomcat10)
   if [[ ${#installed_maybe[@]} -gt 0 ]] && \
      confirm "Protect scored service stack (web server / PHP / database / DNS) from removal in this section?"; then
     local kept=() protected=() m w kept_one
@@ -2257,8 +2406,9 @@ sec_services() {
   prompt_selection "POSSIBLY-unwanted packages to PURGE" "${installed_maybe[@]}"
   for t in "${SELECTED[@]}"; do pkg_remove "$t" && ok "Purged $t"; done
 
-  # Optional daemons to disable (not remove): cups, avahi, rpcbind, bluetooth, nfs
-  local svc_candidates=(cups avahi-daemon rpcbind bluetooth nfs-server nfs-kernel-server)
+  # Optional daemons to disable (not remove): common workstation/remote-access/network daemons.
+  local svc_candidates=(cups avahi-daemon rpcbind bluetooth nfs-server nfs-kernel-server \
+    xrdp vncserver vino-server whoopsie)
   local running_svcs=() s
   for s in "${svc_candidates[@]}"; do
     systemctl list-unit-files 2>/dev/null | grep -q "^${s}\.service" || continue
@@ -2305,6 +2455,52 @@ sec_services() {
     done
   fi
 
+  if confirm "Review per-user crontabs and remove selected ones? Outcome: removes user-level scheduled persistence. Risk: can break legitimate user/app jobs"; then
+    local cron_users=() cron_user cron_out cron_bak
+    while IFS=: read -r cron_user _; do
+      cron_out="$(crontab -l -u "$cron_user" 2>/dev/null || true)"
+      [[ -n "$cron_out" ]] && cron_users+=("$cron_user")
+    done < /etc/passwd
+    prompt_selection "per-user crontabs to REMOVE" "${cron_users[@]}"
+    for cron_user in "${SELECTED[@]}"; do
+      cron_bak="$BACKUP_DIR/crontab-${cron_user}"
+      if crontab -l -u "$cron_user" > "$cron_bak" 2>/dev/null; then
+        chmod 600 "$cron_bak" 2>/dev/null || true
+        record_action "CRONTAB_BACKUP" "$cron_user" "$cron_bak"
+        run crontab -u "$cron_user" -r && ok "Removed crontab for $cron_user"
+      else
+        warn "Could not back up crontab for $cron_user; leaving it unchanged."
+      fi
+    done
+  fi
+
+  if confirm "Restrict cron/at job creation to root only? Outcome: blocks non-root scheduled-job changes. Risk: user/app schedulers may fail"; then
+    local access_file
+    for access_file in /etc/cron.allow /etc/at.allow; do
+      prepare_edit "$access_file"
+      printf 'root\n' > "$access_file"
+      run chown root:root "$access_file"
+      run chmod 400 "$access_file"
+    done
+    for access_file in /etc/cron.deny /etc/at.deny; do
+      if [[ -e "$access_file" ]]; then
+        prepare_edit "$access_file"
+        run rm -f "$access_file"
+      fi
+    done
+    ok "cron.allow and at.allow restricted to root"
+  fi
+
+  if systemctl list-unit-files ctrl-alt-del.target >/dev/null 2>&1 && \
+     confirm "Disable Ctrl-Alt-Del reboot on local console? Outcome: blocks key-chord reboot. Risk: removes an emergency console shortcut"; then
+    local cad_state
+    cad_state="$(systemctl is-enabled ctrl-alt-del.target 2>/dev/null || echo unknown)"
+    record_action "CTRL_ALT_DEL_STATE" "$cad_state"
+    run systemctl mask ctrl-alt-del.target
+    run systemctl daemon-reload
+    ok "Ctrl-Alt-Del reboot target masked"
+  fi
+
   log "Listening sockets after changes:"
   run ss -tulpen
   end_task
@@ -2314,7 +2510,7 @@ sec_services() {
 # SECTION 16 — Critical service config hardening
 # ============================================================================
 sec_service_configs() {
-  start_task "service_configs" "Service Config Hardening (FTP / Apache / Nginx / PHP / DB)"
+  start_task "service_configs" "Service Config Hardening (FTP / Apache / ModSecurity / Nginx / PHP / DB)"
   require_supported_write "Service Config Hardening" || { end_task; return; }
   warn "Only harden service configs here if the service is authorized and should remain installed; every optional hardening item validates before restart when tooling exists."
   if confirm "Apply vsftpd FTP hardening if vsftpd is present?"; then
@@ -2331,6 +2527,11 @@ sec_service_configs() {
     secure_apache_extra_config
   else
     info "Extra Apache hardening skipped by user."
+  fi
+  if confirm "Install/enable Apache ModSecurity in DetectionOnly mode if Apache is present? Outcome: logs WAF matches without blocking the web app. Risk: installs an Apache module and can be noisy; do not switch to blocking mode until the scored app is tested"; then
+    secure_apache_modsecurity
+  else
+    info "Apache ModSecurity setup skipped by user."
   fi
   if confirm "Apply Nginx banner hardening (server_tokens off) if Nginx is present?"; then
     secure_nginx_config
@@ -2368,7 +2569,7 @@ sec_service_configs() {
 sec_perms() {
   start_task "perms" "File Permissions & umask"
   require_supported_write "File Permissions & umask" || { end_task; return; }
-  local f
+  local f d user uid home log_file log_owner _pw _gid _gecos _shell
   for f in /etc/passwd /etc/group; do
     [[ -e "$f" ]] || continue; record_perm "$f"; run chmod 644 "$f"; run chown root:root "$f"
   done
@@ -2376,10 +2577,13 @@ sec_perms() {
     [[ -e "$f" ]] || continue; record_perm "$f"; run chmod 640 "$f"; run chown root:root "$f"
   done
   if [[ -e "$SSHD_CONFIG" ]]; then record_perm "$SSHD_CONFIG"; run chmod 600 "$SSHD_CONFIG"; fi
-  if [[ -d /tmp ]]; then record_perm /tmp; run chmod 1777 /tmp; fi
+  for f in /tmp /var/tmp /dev/shm; do
+    [[ -d "$f" ]] || continue
+    record_perm "$f"
+    run chmod 1777 "$f"
+  done
 
   # per-user .ssh
-  local d
   while IFS= read -r d; do
     [[ -d "$d" ]] || continue; record_perm "$d"; run chmod 700 "$d"
   done < <(find /home /root -maxdepth 2 -name .ssh -type d 2>/dev/null)
@@ -2387,6 +2591,35 @@ sec_perms() {
     [[ -f "$f" ]] || continue; record_perm "$f"; run chmod 600 "$f"
   done < <(find /home /root -maxdepth 3 -name authorized_keys -type f 2>/dev/null)
   ok "Key file permissions tightened"
+
+  if confirm "Tighten top-level human home directories to 750? Outcome: prevents other local users from browsing homes. Risk: breaks deliberate shared files or web content served from home directories"; then
+    while IFS=: read -r user _pw uid _gid _gecos home _shell; do
+      [[ "$uid" =~ ^[0-9]+$ && "$uid" -ge 1000 && "$uid" -lt 65534 ]] || continue
+      [[ -d "$home" ]] || continue
+      record_perm "$home"
+      run chmod 750 "$home"
+      ok "Tightened $home for $user"
+    done < /etc/passwd
+  fi
+
+  if confirm "Tighten common log file permissions? Outcome: removes world access from auth/system logs and ensures btmp exists. Risk: non-root log readers or monitoring agents may need group access adjusted"; then
+    if [[ ! -e /var/log/btmp ]]; then
+      prepare_edit /var/log/btmp
+      run touch /var/log/btmp
+      if getent group utmp >/dev/null 2>&1; then log_owner="root:utmp"; else log_owner="root:root"; fi
+      run chown "$log_owner" /var/log/btmp
+      run chmod 600 /var/log/btmp
+    fi
+    for log_file in /var/log/btmp /var/log/wtmp /var/log/lastlog /var/log/faillog \
+      /var/log/auth.log /var/log/secure /var/log/syslog /var/log/messages \
+      /var/log/audit/audit.log; do
+      [[ -e "$log_file" ]] || continue
+      record_perm "$log_file"
+      run chmod o-rwx "$log_file"
+      run chmod g-w "$log_file"
+    done
+    ok "Common log permissions tightened"
+  fi
 
   # umask 027 via profile.d (revertible: it's a new file)
   local uf="/etc/profile.d/99-umask-hardening.sh"
@@ -2462,9 +2695,9 @@ EOF
 # SECTION 19 — auditd
 # ============================================================================
 sec_auditd() {
-  start_task "auditd" "Auditd"
-  require_supported_write "Auditd" || { end_task; return; }
-  require_systemd_task "Auditd" || { end_task; return; }
+  start_task "auditd" "Auditd / rsyslog / Process Accounting"
+  require_supported_write "Auditd / rsyslog / Process Accounting" || { end_task; return; }
+  require_systemd_task "Auditd / rsyslog / Process Accounting" || { end_task; return; }
   if is_debian; then
     if ! pkg_install_tracked auditd; then
       warn "auditd is not available; skipping Auditd section."
@@ -2500,6 +2733,32 @@ EOF
   run auditctl -e 1        # enable auditing (the checklist's 'auditctl -e 1')
   run auditctl -l
   ok "auditd enabled with identity/sudoers/sshd/authlog watch rules"
+
+  if confirm "Ensure rsyslog is installed and enabled? Outcome: keeps traditional auth/system logs populated. Risk: installs/enables a logging daemon and may duplicate journald logs"; then
+    if pkg_install_tracked rsyslog; then
+      if systemctl list-unit-files 2>/dev/null | grep -q '^rsyslog\.service'; then
+        record_service rsyslog
+        run systemctl enable --now rsyslog
+        ok "rsyslog enabled"
+      else
+        warn "rsyslog package installed, but rsyslog.service was not found."
+      fi
+    fi
+  fi
+
+  if confirm "Enable process accounting? Outcome: records executed commands for incident review. Risk: adds command metadata/log volume"; then
+    local acct_pkg acct_svc
+    if is_debian; then acct_pkg="acct"; acct_svc="acct"; else acct_pkg="psacct"; acct_svc="psacct"; fi
+    if pkg_install_tracked "$acct_pkg"; then
+      if systemctl list-unit-files 2>/dev/null | grep -q "^${acct_svc}\\.service"; then
+        record_service "$acct_svc"
+        run systemctl enable --now "$acct_svc"
+        ok "Process accounting enabled via $acct_svc"
+      else
+        warn "$acct_svc.service was not found after installing $acct_pkg; process accounting not enabled."
+      fi
+    fi
+  fi
   end_task
 }
 
@@ -2581,7 +2840,7 @@ sec_aide() {
 # SECTION 22 — Security audit tools (install + run, mostly read-only)
 # ============================================================================
 sec_tools() {
-  start_task "tools" "Security Audit Tools (ClamAV / rkhunter / Lynis / Stacer)"
+  start_task "tools" "Security Audit Tools (ClamAV / rkhunter / Lynis / Unhide / Stacer)"
   require_supported_write "Security Audit Tools" || { end_task; return; }
   if confirm "Install & run ClamAV, rkhunter, chkrootkit (downloads signatures, can be slow)?"; then
     pkg_install_tracked clamav || warn "ClamAV unavailable; freshclam scan prep skipped."
@@ -2613,6 +2872,14 @@ sec_tools() {
       warn "lynis not available via package manager; skip or install from upstream."
     fi
   fi
+  if confirm "Install & run Unhide hidden-process checks? Outcome: finds hidden processes/ports. Risk: slow or noisy on busy systems"; then
+    pkg_install_tracked unhide || warn "unhide unavailable; hidden-process checks skipped."
+    if command -v unhide >/dev/null 2>&1; then
+      run unhide -f brute proc procall procfs quick reverse sys || warn "unhide reported findings or errors; review output."
+    else
+      warn "unhide command not available; skipped."
+    fi
+  fi
   if confirm "Install Logwatch and produce a one-shot log summary?"; then
     pkg_install_tracked logwatch
     if command -v logwatch >/dev/null 2>&1; then
@@ -2632,17 +2899,28 @@ sec_tools() {
 }
 
 # ============================================================================
-# SECTION 23 — Remove unauthorized media (.mp3) — DESTRUCTIVE / NOT REVERTIBLE
+# SECTION 23 — Remove unauthorized media files — DESTRUCTIVE / NOT REVERTIBLE
 # ============================================================================
 sec_mp3() {
-  start_task "mp3" "Remove unauthorized .mp3 files (DESTRUCTIVE)"
-  require_supported_write "Remove unauthorized .mp3 files" || { end_task; return; }
+  start_task "mp3" "Remove unauthorized media files (DESTRUCTIVE)"
+  require_supported_write "Remove unauthorized media files" || { end_task; return; }
   warn "This deletes files PERMANENTLY and CANNOT be undone by revert.sh."
   warn "Per the checklist, only do this AFTER any forensics is complete."
-  local files
-  mapfile -t files < <(find / -iname "*.mp3" 2>/dev/null)
-  prompt_selection ".mp3 files to DELETE" "${files[@]}"
-  if [[ ${#SELECTED[@]} -gt 0 ]] && ask_risky "PERMANENTLY delete the ${#SELECTED[@]} selected .mp3 file(s)"; then
+  local files ext
+  local exts=(mp3)
+  if confirm "Also include common audio/video/image extensions? Outcome: catches more unauthorized media. Risk: web/app assets may match, so review before deleting"; then
+    exts=(midi mid mod mp3 mp2 mpa abs mpega au snd wav aiff aif sid flac ogg \
+      mpeg mpg mpe movie mov avi wmv asf asx wma wax wmx 3gp mp4 flv m4v \
+      tiff tif gif jpeg jpg jpe png rgb xwd xpm ppm pbm pgm pcx ico svg svgz)
+  fi
+  local find_expr=()
+  for ext in "${exts[@]}"; do
+    [[ ${#find_expr[@]} -gt 0 ]] && find_expr+=(-o)
+    find_expr+=(-iname "*.${ext}")
+  done
+  mapfile -t files < <(find / -type f \( "${find_expr[@]}" \) 2>/dev/null)
+  prompt_selection "media files to DELETE" "${files[@]}"
+  if [[ ${#SELECTED[@]} -gt 0 ]] && ask_risky "PERMANENTLY delete the ${#SELECTED[@]} selected media file(s)"; then
     local fpath
     for fpath in "${SELECTED[@]}"; do
       record_action "FILE_DELETED_PERMANENT" "$fpath"
@@ -2814,14 +3092,14 @@ SECTION_DESC=(
   "Firewall (UFW / firewalld)"
   "Kernel / sysctl Hardening"
   "Unwanted Services & Packages"
-  "Service Config Hardening (FTP / Apache / Nginx / PHP / DB)"
+  "Service Config Hardening (FTP / Apache / ModSecurity / Nginx / PHP / DB)"
   "File Permissions & umask"
   "Display Manager (guest / autologin)"
-  "Auditd"
+  "Auditd / rsyslog / Process Accounting"
   "Fail2ban (SSH brute-force protection)"
   "Mandatory Access Control (AppArmor / SELinux)"
-  "Security Audit Tools (ClamAV / rkhunter / Lynis / Logwatch / Stacer)"
-  "Remove unauthorized .mp3 files (DESTRUCTIVE)"
+  "Security Audit Tools (ClamAV / rkhunter / Lynis / Unhide / Logwatch / Stacer)"
+  "Remove unauthorized media files (DESTRUCTIVE)"
   "Package Integrity Audit"
   "AIDE File Integrity Baseline"
 )

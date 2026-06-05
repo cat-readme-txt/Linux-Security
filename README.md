@@ -77,14 +77,14 @@ Each run writes to `/var/backups/security-hardening/run_<timestamp>/`:
 13. Firewall (UFW / firewalld)
 14. Kernel / sysctl Hardening
 15. Unwanted Services & Packages
-16. Service Config Hardening (FTP / Apache / Nginx / PHP / DB)
+16. Service Config Hardening (FTP / Apache / ModSecurity / Nginx / PHP / DB)
 17. File Permissions & umask
 18. Display Manager (guest / autologin) — *restart deferred to end of run*
-19. Auditd
+19. Auditd / rsyslog / Process Accounting
 20. Fail2ban (SSH brute-force protection)
 21. Mandatory Access Control (AppArmor / SELinux)
-22. Security Audit Tools (ClamAV / rkhunter / Lynis / Logwatch / Stacer)
-23. Remove unauthorized `.mp3` files (**destructive, NOT revertible**)
+22. Security Audit Tools (ClamAV / rkhunter / Lynis / Unhide / Logwatch / Stacer)
+23. Remove unauthorized media files (**destructive, NOT revertible**)
 24. Package Integrity Audit
 25. AIDE File Integrity Baseline
 
@@ -134,9 +134,13 @@ candidates against it. This section:
 - PHP dangerous-function/session-cookie hardening (can break apps that call shell functions or use HTTP-only sessions)
 - AIDE baseline initialization (trusts the current filesystem state)
 - `pam_faillock` lockout-after-failures
+- Restricting `su` to the distro admin group (`sudo` or `wheel`)
 - Applying password aging to existing accounts
 - Resetting weak passwords (section 10 — confirmed before running)
-- Permanently deleting `.mp3` files
+- Apache ModSecurity setup in DetectionOnly mode
+- Top-level home directory privacy and common log permission tightening
+- Process accounting / rsyslog enablement (extra logging and service changes)
+- Permanently deleting media files
 
 ### Competition notes
 For the eCitadel orientation scenario, SSH, HTTP, and DNS are scored services.
@@ -155,17 +159,19 @@ Useful read-only check inputs:
 ### Distro-specific behavior
 Debian / Ubuntu:
 - Uses `apt`, `unattended-upgrades`, `apt-listchanges`, UFW, AppArmor, Debian
-  OpenSSH service naming, and `/etc/pam.d/common-*` PAM files.
+  OpenSSH service naming, `rsyslog`, `acct`, and `/etc/pam.d/common-*` PAM files.
 - Uses Debian/Ubuntu web paths such as `/etc/apache2`, `/etc/nginx`, and
-  `/etc/php/*/*/php.ini` when present.
+  `/etc/php/*/*/php.ini` when present. Apache ModSecurity uses
+  `libapache2-mod-security2` when available.
 
 RHEL / Fedora / AlmaLinux / Rocky Linux:
 - Uses `dnf` or `yum`, `dnf-automatic` or `yum-cron`, firewalld, SELinux,
-  `wheel`, `audit`, and `sshd`.
+  `wheel`, `audit`, `rsyslog`, `psacct`, and `sshd`.
 - Uses `authselect` for `faillock`; authselect-managed PAM files are inspected
   but not hand-edited for `pam_pwquality`.
 - Uses RHEL-family paths such as `/etc/httpd`, `/etc/php.ini`, `/etc/my.cnf.d`,
-  and BIND config locations when present.
+  and BIND config locations when present. Apache ModSecurity uses `mod_security`
+  when available.
 
 Systemd note:
 - Write tasks that manage services require `systemctl`; non-systemd support is
@@ -194,7 +200,7 @@ file permissions/ownership, original service enabled/active states, package stat
 **reset passwords (the original hash is restored)**, etc.
 It asks once whether to also uninstall packages the tool installed (default: keep them).
 
-**Cannot be reverted:** permanently deleted files (e.g. `.mp3`). These are reported, not restored.
+**Cannot be reverted:** permanently deleted media files. These are reported, not restored.
 
 ---
 

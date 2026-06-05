@@ -59,7 +59,7 @@ if [[ -z "$LOG" ]]; then
     RUN_DIR="$(dirname "$LOG")"
   else
     # fall back to newest run_* directory
-    local_newest="$(ls -1dt "$STATE_BASE"/run_* 2>/dev/null | head -1)"
+    local_newest="$(find "$STATE_BASE" -maxdepth 1 -type d -name 'run_*' -print 2>/dev/null | sort -r | head -1)"
     if [[ -n "$local_newest" ]]; then
       RUN_DIR="$local_newest"; LOG="$local_newest/actions.log"
     fi
@@ -96,7 +96,7 @@ for l in "${LINES[@]}"; do
     IFS='|' read -r _ tid _rest <<<"$l"
     [[ -z "$tid" ]] && continue          # e.g. the META line has no task
     idx="${IDX_OF[$tid]:-}"
-    [[ -n "$idx" ]] && TASK_NACT[$idx]=$(( TASK_NACT[idx] + 1 ))
+    [[ -n "$idx" ]] && TASK_NACT[idx]=$(( TASK_NACT[idx] + 1 ))
   fi
 done
 
@@ -175,7 +175,7 @@ restore_service_state() {
 # Revert a single ACTION line. Receives the full pipe-delimited line.
 revert_action() {
   local line="$1"
-  IFS='|' read -r _tag _task type a1 a2 a3 a4 <<<"$line"
+  IFS='|' read -r _tag _task type a1 a2 a3 _rest <<<"$line"
   case "$type" in
     FILE_BACKUP)
       if [[ -f "$a2" ]]; then
@@ -269,6 +269,22 @@ revert_action() {
       ;;
     TIMER)
       systemctl disable --now "$a1" >/dev/null 2>&1 && echo "  ${C_GRN}disabled timer${C_RST} $a1"
+      ;;
+    CRONTAB_BACKUP)
+      if [[ -f "$a2" ]]; then
+        crontab -u "$a1" "$a2" && echo "  ${C_GRN}restored crontab${C_RST} for $a1"
+      else
+        echo "  ${C_YEL}crontab backup missing for $a1 ($a2)${C_RST}"
+      fi
+      ;;
+    CTRL_ALT_DEL_STATE)
+      if [[ "$a1" == "masked" ]]; then
+        echo "  ${C_BLU}left Ctrl-Alt-Del target masked${C_RST} (it was masked before harden.sh)"
+      else
+        systemctl unmask ctrl-alt-del.target >/dev/null 2>&1
+        systemctl daemon-reload >/dev/null 2>&1
+        echo "  ${C_GRN}unmasked Ctrl-Alt-Del target${C_RST}"
+      fi
       ;;
     FILE_DELETED_PERMANENT)
       echo "  ${C_RED}CANNOT REVERT${C_RST} permanently deleted file: $a1"
