@@ -1,13 +1,20 @@
 # Linux Hardening Toolkit
 
-Two scripts implementing the "Linux System Checklist" with corrections:
+Two scripts implementing the "Linux System Checklist" with corrections. This
+toolkit is built for cybersecurity blue-teaming competitions, especially web VM
+hardening, but it also works for general Linux securing when the same services
+and assumptions apply.
 
 - **`harden.sh`** — menu-driven hardening. Logs and backs up everything it changes.
 - **`revert.sh`** — reads the log produced by `harden.sh` and rolls back any task.
 
-Supports **Debian / Ubuntu / Mint** (apt) and **RHEL / Alma / Rocky / CentOS / Fedora**
-(dnf/yum), auto-detected from `/etc/os-release`. If detection fails, you're prompted
-to pick the family.
+Fully supported write-hardening targets:
+- **Debian / Ubuntu** with `apt`
+- **RHEL / Fedora / AlmaLinux / Rocky Linux** with `dnf` or `yum`
+
+Other distros are treated as unsupported for write-hardening. Read-only checks
+can still run, but write-capable tasks print an unsupported-distro message and
+skip instead of guessing.
 
 ---
 
@@ -28,13 +35,17 @@ sudo ./revert.sh                  # uses the most recent run automatically
 ## `harden.sh`
 
 ```
-sudo ./harden.sh [--authorized PATH] [--state-dir DIR] [--yes-risky] [--wordlist PATH]
+sudo ./harden.sh [--authorized PATH] [--state-dir DIR] [--yes-risky] [--competition-safe] [--wordlist PATH]
 sudo ./harden.sh --show-last          # replay the most recent run's transcript
 ```
 
 - Presents a numbered menu. Enter space-separated numbers (`1 4 6`), `a` for all, or `q`.
 - After picking a section, **risky** items still prompt individually (default = No).
   `--yes-risky` auto-approves them (use with care).
+- `--competition-safe` disables risky auto-approval, runs the read-only competition
+  checks first, and runs scored-service health again before deferred actions.
+- The script only runs write-hardening tasks on fully supported distro families.
+  Unsupported distros keep read-only checks available and skip unsupported tasks.
 - For service/package/user removal it asks: **process all? / choose which to ignore? /
   type `all` to skip the task entirely and change nothing.**
 - The **entire session is mirrored to `output.log`** (live terminal *and* file). If a
@@ -51,23 +62,37 @@ Each run writes to `/var/backups/security-hardening/run_<timestamp>/`:
 - a `latest` symlink points at the newest run.
 
 ### Sections
-1. User & Group Audit (needs `authorized.txt`)
-2. Password Policies (aging + complexity)
-3. **Password Strength Audit (detect & reset weak passwords)**
-4. Account Lockout / Empty Passwords / nullok
-5. SSH Hardening
-6. Firewall (UFW / firewalld)
-7. Kernel / sysctl Hardening
-8. Unwanted Services & Packages
-9. File Permissions & umask
-10. Display Manager (guest / autologin) — *restart deferred to end of run*
-11. Auditd
-12. Automatic Security Updates
-13. Security Audit Tools (ClamAV / rkhunter / Lynis)
-14. Forensic / Persistence Checks (**read-only** — nothing to revert)
-15. Remove unauthorized `.mp3` files (**destructive, NOT revertible**)
+1. Scored Service Health Check (**read-only**)
+2. AD / DNS / Time Dependency Check (**read-only**)
+3. DNS Service Validation (**read-only**)
+4. Webroot Malware & Permissions Sweep (**read-only**)
+5. Forensic / Persistence Checks (**read-only** — nothing to revert)
+6. Web/App Backup Snapshot
+7. User & Group Audit (needs `authorized.txt`)
+8. Package Upgrade / Automatic Security Updates
+9. Password Policies (aging + complexity)
+10. **Password Strength Audit (detect & reset weak passwords)**
+11. Account Lockout / Empty Passwords / nullok
+12. SSH Hardening
+13. Firewall (UFW / firewalld)
+14. Kernel / sysctl Hardening
+15. Unwanted Services & Packages
+16. Service Config Hardening (FTP / Apache / Nginx / PHP / DB)
+17. File Permissions & umask
+18. Display Manager (guest / autologin) — *restart deferred to end of run*
+19. Auditd
+20. Fail2ban (SSH brute-force protection)
+21. Mandatory Access Control (AppArmor / SELinux)
+22. Security Audit Tools (ClamAV / rkhunter / Lynis / Logwatch / Stacer)
+23. Remove unauthorized `.mp3` files (**destructive, NOT revertible**)
+24. Package Integrity Audit
+25. AIDE File Integrity Baseline
 
-### Password Strength Audit (section 3)
+Package upgrades are logged, but package version rollbacks are not automated by
+`revert.sh`; use package-manager snapshots/rollback tooling if you need version
+rollback guarantees.
+
+### Password Strength Audit (section 10)
 You can't tell if an *existing* password is weak from its hash — you have to test
 candidates against it. This section:
 1. Prefers **John the Ripper + the rockyou wordlist** (the standard, most popular tooling).
@@ -89,16 +114,62 @@ candidates against it. This section:
 > you don't lose competition points). The same applies to a `wordlists` package it installs.
 
 ### Risky items (always prompted, default No)
+- Full package upgrade (can restart or change scored services)
+- Web/app and DB backup snapshots (can be slow and stores secrets in the run dir)
 - SSH port 22 → 2222
 - `PasswordAuthentication no` (skipped automatically if no SSH keys exist)
 - `AllowGroups sshusers`
 - Enabling the firewall (SSH is allowed first to avoid lockout)
+- Enabling `fail2ban` (can ban scoring/Orange Team source IPs if misconfigured)
+- `fail2ban` ignore-list entries (trusted IPs/CIDRs will never be banned)
+- Locking root
+- Injecting `pam_pwquality` into PAM stacks
+- Enforcing SELinux/AppArmor profiles
 - `icmp_echo_ignore_all` (blocks ping; the checklist warns it can break scoring)
 - Disabling IPv6
+- Checklist TCP tuning / low `fs.file-max`
+- `/etc/host.conf` `nospoof on` compatibility item
+- BIND recursion ACLs / zone-transfer defaults (can break resolver clients or secondary DNS)
+- Apache/Nginx directory-listing and browser-header hardening (can break intentional indexes, embeds, or cross-origin flows)
+- PHP dangerous-function/session-cookie hardening (can break apps that call shell functions or use HTTP-only sessions)
+- AIDE baseline initialization (trusts the current filesystem state)
 - `pam_faillock` lockout-after-failures
 - Applying password aging to existing accounts
-- Resetting weak passwords (section 3 — confirmed before running)
+- Resetting weak passwords (section 10 — confirmed before running)
 - Permanently deleting `.mp3` files
+
+### Competition notes
+For the eCitadel orientation scenario, SSH, HTTP, and DNS are scored services.
+The web checks expect the original dynamic functionality to keep working; static
+HTML replacement is not enough. Scoring sources can change IPs, and most checks
+use AD authentication, so do not block broad networks or break DNS/time/domain
+dependencies. After risky sections, verify SSH, HTTP app login/functionality, and
+DNS before moving on.
+
+Useful read-only check inputs:
+- `WEB_CHECK_URLS='http://127.0.0.1/ http://127.0.0.1/login'`
+- `DNS_TEST_NAME='rrintel.internal'`
+- `AD_DOMAIN='rrintel.internal'`
+- `FAIL2BAN_IGNOREIP='10.0.0.5 10.0.0.0/24'`
+
+### Distro-specific behavior
+Debian / Ubuntu:
+- Uses `apt`, `unattended-upgrades`, `apt-listchanges`, UFW, AppArmor, Debian
+  OpenSSH service naming, and `/etc/pam.d/common-*` PAM files.
+- Uses Debian/Ubuntu web paths such as `/etc/apache2`, `/etc/nginx`, and
+  `/etc/php/*/*/php.ini` when present.
+
+RHEL / Fedora / AlmaLinux / Rocky Linux:
+- Uses `dnf` or `yum`, `dnf-automatic` or `yum-cron`, firewalld, SELinux,
+  `wheel`, `audit`, and `sshd`.
+- Uses `authselect` for `faillock`; authselect-managed PAM files are inspected
+  but not hand-edited for `pam_pwquality`.
+- Uses RHEL-family paths such as `/etc/httpd`, `/etc/php.ini`, `/etc/my.cnf.d`,
+  and BIND config locations when present.
+
+Systemd note:
+- Write tasks that manage services require `systemctl`; non-systemd support is
+  intentionally out of scope for now.
 
 ### Recovering an interrupted run
 The complete transcript is always on disk at
@@ -131,7 +202,8 @@ It asks once whether to also uninstall packages the tool installed (default: kee
 - Fixed commands that used en-dashes/smart-dashes instead of `--`.
 - The toolkit uses **UFW *or* firewalld** (never raw iptables on top of UFW, which conflict).
 - vsftpd-restart copy-paste error (it restarted gdm) and the bogus
-  `banner-message-enable` directive are not reproduced.
+  `banner-message-enable` directive are not reproduced; FTP hardening uses
+  `ftpd_banner` and validates/restores around service restart.
 - `Protocol 2` is **not** emitted — it's removed on OpenSSH ≥ 7.6 and would fail `sshd -t`.
 - SSH config is validated with `sshd -t` before restart; on failure the backup is restored.
 - `PasswordAuthentication no` is only offered when SSH keys actually exist.
