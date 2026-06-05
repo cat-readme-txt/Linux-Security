@@ -59,7 +59,8 @@ DISTRO_ID=""; DISTRO_VER=""; DISTRO_LIKE=""
 ADMIN_GROUP="sudo"       # sudo (debian) or wheel (rhel)
 SSHD_CONFIG="/etc/ssh/sshd_config"
 
-declare -A BACKED_UP CREATED      # de-dup file backups (scoped per task)
+declare -A BACKED_UP CREATED      # per-task staging backups for same-task rollback
+declare -A ORIGINAL_BACKED_UP ORIGINAL_CREATED  # first-seen state for the full session
 CURRENT_TASK=""
 SELECTED=()                       # output of prompt_selection()
 DEFERRED_DESC=(); DEFERRED_CMD=() # session-disrupting actions, run at the very end
@@ -161,7 +162,7 @@ record_action() {
 
 start_task() {  # $1 = task id, $2 = human description
   CURRENT_TASK="$1"
-  BACKED_UP=(); CREATED=()          # backups are scoped per task for clean revert
+  BACKED_UP=(); CREATED=()          # staging snapshots are scoped per task
   echo "TASK_START|$1|$2|$(date -Iseconds)" >> "$ACTIONS_LOG"
   echo ""
   echo "${C_BLD}${C_GRN}==> $2${C_RST}"
@@ -175,18 +176,29 @@ end_task() {
 # Backup helpers (revertibility)
 # ----------------------------------------------------------------------------
 # prepare_edit FILE — call before modifying FILE.
-#   If FILE exists  -> copy it into the backup tree and record FILE_BACKUP.
-#   If FILE absent  -> record FILE_CREATE (revert will delete it) and mkdir parent.
+#   FILE_BACKUP records a task-local pre-edit snapshot, so reverting one task can
+#   restore the state before that task. A separate original-files copy preserves
+#   the first-seen session state without being overwritten by later tasks.
+#   If FILE absent -> record FILE_CREATE (revert will delete it) and mkdir parent.
 prepare_edit() {
-  local f="$1"
+  local f="$1" dest original_dest task_id
+  task_id="${CURRENT_TASK:-global}"
   if [[ -e "$f" ]]; then
+    [[ -n "${CREATED[$f]:-}" ]] && return 0
+    if [[ -z "${ORIGINAL_BACKED_UP[$f]:-}" && -z "${ORIGINAL_CREATED[$f]:-}" ]]; then
+      original_dest="$BACKUP_DIR/original-files$f"
+      mkdir -p "$(dirname "$original_dest")"
+      cp -a "$f" "$original_dest"
+      ORIGINAL_BACKED_UP[$f]="$original_dest"
+    fi
     [[ -n "${BACKED_UP[$f]:-}" ]] && return 0
-    local dest="$BACKUP_DIR/files$f"
+    dest="$BACKUP_DIR/files/${task_id}$f"
     mkdir -p "$(dirname "$dest")"
     cp -a "$f" "$dest"
     record_action "FILE_BACKUP" "$f" "$dest"
-    BACKED_UP[$f]=1
+    BACKED_UP[$f]="$dest"
   else
+    [[ -z "${ORIGINAL_BACKED_UP[$f]:-}" && -z "${ORIGINAL_CREATED[$f]:-}" ]] && ORIGINAL_CREATED[$f]=1
     [[ -n "${CREATED[$f]:-}" ]] && return 0
     record_action "FILE_CREATE" "$f"
     CREATED[$f]=1
@@ -313,7 +325,7 @@ detect_distro() {
     . /etc/os-release
     DISTRO_ID="${ID:-}"; DISTRO_VER="${VERSION_ID:-}"; DISTRO_LIKE="${ID_LIKE:-}"
   fi
-  local id="${DISTRO_ID,,}"
+  local id="${DISTRO_ID,,}" like=" ${DISTRO_LIKE,,} "
   case "$id" in
     debian|ubuntu)
       DISTRO_FAMILY="debian"
@@ -335,12 +347,19 @@ detect_distro() {
       fi
       ;;
     *)
-      DISTRO_FAMILY="unsupported"
-      WRITE_SUPPORTED=0
-      if command -v apt-get >/dev/null 2>&1; then PKG_FAMILY="apt"
-      elif command -v dnf >/dev/null 2>&1; then PKG_FAMILY="dnf"
-      elif command -v yum >/dev/null 2>&1; then PKG_FAMILY="yum"
-      else PKG_FAMILY="unknown"; fi
+      if [[ "$like" == *" debian "* || "$like" == *" ubuntu "* ]] && command -v apt-get >/dev/null 2>&1; then
+        DISTRO_FAMILY="debian"
+        ADMIN_GROUP="sudo"
+        PKG_FAMILY="apt"
+        WRITE_SUPPORTED=1
+      else
+        DISTRO_FAMILY="unsupported"
+        WRITE_SUPPORTED=0
+        if command -v apt-get >/dev/null 2>&1; then PKG_FAMILY="apt"
+        elif command -v dnf >/dev/null 2>&1; then PKG_FAMILY="dnf"
+        elif command -v yum >/dev/null 2>&1; then PKG_FAMILY="yum"
+        else PKG_FAMILY="unknown"; fi
+      fi
       ;;
   esac
 
@@ -1254,7 +1273,7 @@ sec_passwords() {
 # John the Ripper + the rockyou wordlist (the most popular tooling for this),
 # auto-removing john afterward if we installed it (it is a dual-use cracker and
 # is on this toolkit's own purge list). When john/network is unavailable we
-# fall back to a built-in crypt-compare (python3) over a common-password list.
+# fall back to a built-in crypt-compare when python3 still provides crypt.
 
 # Generate a strong random password: 20 chars, guaranteeing one of each of the
 # four character classes (the rest random). LC_ALL=C is required so that tr
@@ -1302,6 +1321,13 @@ sys.exit(1)
 PY
 }
 
+python_crypt_available() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - <<'PY' >/dev/null 2>&1
+import crypt
+PY
+}
+
 sec_pwaudit() {
   start_task "pwaudit" "Password Strength Audit (detect & reset weak passwords)"
   require_supported_write "Password Strength Audit" || { end_task; return; }
@@ -1310,7 +1336,17 @@ sec_pwaudit() {
   if ! confirm "Proceed with the password strength audit?"; then
     info "Skipped by user."; end_task; return
   fi
-  command -v python3 >/dev/null 2>&1 || warn "python3 not found; built-in fallback unavailable."
+  local builtin_crypt_ok=0 pyver=""
+  if command -v python3 >/dev/null 2>&1; then
+    if python_crypt_available; then
+      builtin_crypt_ok=1
+    else
+      pyver="$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:3])))' 2>/dev/null || true)"
+      warn "python3 crypt module unavailable${pyver:+ (python $pyver)}; built-in fallback disabled. Python 3.13+ removed crypt, so use John the Ripper for password auditing."
+    fi
+  else
+    warn "python3 not found; built-in fallback unavailable."
+  fi
 
   # The account running this audit (the competitor's assigned user) is NOT
   # scored for password strength and must keep its password — skip it entirely.
@@ -1401,14 +1437,15 @@ sec_pwaudit() {
       [[ -n "$cu" && -n "${USERHASH[$cu]:-}" ]] && WEAK["$cu"]="$cp"
     done < <("$john_bin" --show "$combo" 2>/dev/null | grep ':' )
   else
-    warn "John unavailable; using built-in crypt-compare fallback."
-    if command -v python3 >/dev/null 2>&1; then
+    if [[ $builtin_crypt_ok -eq 1 ]]; then
+      warn "John unavailable; using built-in crypt-compare fallback."
       for u in "${!USERHASH[@]}"; do
         local pw; pw="$(crack_one_builtin "$u" "${USERHASH[$u]}" "$wordlist")"
         [[ -n "$pw" ]] && WEAK["$u"]="$pw"
       done
     else
-      err "Neither john nor python3 available; cannot audit. Aborting section."
+      err "John unavailable and python3 crypt fallback unavailable; cannot audit password hashes. Install John the Ripper or run the audit on a Python version that still ships crypt."
+      [[ "$WL_INSTALLED" == "1" ]] && { info "Removing 'wordlists' package (installed only for this audit)."; run pkg_remove_silent wordlists; }
       end_task; return
     fi
   fi
@@ -1880,11 +1917,13 @@ validate_vsftpd_config() {
 
 restore_task_backup() {
   local f="$1"
-  local bak="$BACKUP_DIR/files$f"
-  if [[ -f "$bak" ]]; then
+  local bak="${BACKED_UP[$f]:-}"
+  if [[ -n "$bak" && -f "$bak" ]]; then
     cp -a "$bak" "$f"
   elif [[ -n "${CREATED[$f]:-}" && -e "$f" ]]; then
     rm -f "$f"
+  else
+    warn "No task-local backup recorded for $f; cannot automatically restore this staged edit."
   fi
 }
 
@@ -2348,7 +2387,7 @@ sec_services() {
     inetutils-talk inetutils-talkd inetutils-telnet inetutils-telnetd \
     rsh-server rsh rsh-client rsh-redone-server rsh-redone-client rlinetd \
     tightvnc tightvnc-common tightvncserver vncserver x11vnc tigervnc-server xrdp \
-    vsftpd proftpd-basic proftpd pure-ftpd ftp tnftp sftpd tftpd-hpa tftp-server tftpd atftpd \
+    proftpd-basic proftpd pure-ftpd ftp tnftp sftpd tftpd-hpa tftp-server tftpd atftpd \
     autofs nfs-common nfs-kernel-server nfs-utils nis portmap rpcbind ypbind ypserv \
     snmpd net-snmp talkd ntalk talk pop3 \
     dovecot-pop3d courier-pop \
@@ -2364,7 +2403,7 @@ sec_services() {
     apache apache2 httpd nginx nginx-common lighttpd mysql mysql-client-5.5 mysql-client-5.6 \
     mysql-client-core-5.5 mysql-client-core-5.6 mysql-common-5.5 mysql-common-5.6 \
     mysql-server mysql-server-5.5 mysql-server-5.6 mysql-server-core-5.6 \
-    mariadb-server php php-fpm libapache2-mod-php bind bind9 named \
+    mariadb-server php php-fpm libapache2-mod-php bind bind9 named vsftpd \
     dovecot-core dovecot-imapd sendmail postfix exim4 snmp dnsmasq unbound \
     tomcat tomcat6 tomcat7 tomcat8 tomcat9 tomcat10 php5)
 
@@ -2383,11 +2422,12 @@ sec_services() {
 
   # --- Scored-service protection: shield critical services from accidental purge. ---
   # In the eCitadel orientation, SSH/HTTP/DNS are scored, and web functionality
-  # may depend on PHP and a database. Offer to protect these from removal here;
-  # they should be SECURED instead (see Service Config section).
+  # may depend on PHP and a database. vsftpd is protected here too when it is
+  # authorized, because this script has a validated hardening path for it.
+  # Protected services should be SECURED instead (see Service Config section).
   local web_stack=(apache apache2 httpd nginx lighttpd php php-fpm libapache2-mod-php \
     mysql-server mariadb-server postgresql postgresql-server bind9 named unbound dnsmasq \
-    tomcat tomcat6 tomcat7 tomcat8 tomcat9 tomcat10)
+    tomcat tomcat6 tomcat7 tomcat8 tomcat9 tomcat10 vsftpd)
   if [[ ${#installed_maybe[@]} -gt 0 ]] && \
      confirm "Protect scored service stack (web server / PHP / database / DNS) from removal in this section?"; then
     local kept=() protected=() m w kept_one

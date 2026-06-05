@@ -10,6 +10,8 @@ and assumptions apply.
 
 Fully supported write-hardening targets:
 - **Debian / Ubuntu** with `apt`
+- **Debian/Ubuntu-like apt distros** using `ID_LIKE=debian` or `ID_LIKE=ubuntu`
+  such as Linux Mint, Pop!_OS, and Kali
 - **RHEL / Fedora / AlmaLinux / Rocky Linux** with `dnf` or `yum`
 
 Other distros are treated as unsupported for write-hardening. Read-only checks
@@ -157,7 +159,7 @@ Useful read-only check inputs:
 - `FAIL2BAN_IGNOREIP='10.0.0.5 10.0.0.0/24'`
 
 ### Distro-specific behavior
-Debian / Ubuntu:
+Debian / Ubuntu and Debian-like apt distros:
 - Uses `apt`, `unattended-upgrades`, `apt-listchanges`, UFW, AppArmor, Debian
   OpenSSH service naming, `rsyslog`, `acct`, and `/etc/pam.d/common-*` PAM files.
 - Uses Debian/Ubuntu web paths such as `/etc/apache2`, `/etc/nginx`, and

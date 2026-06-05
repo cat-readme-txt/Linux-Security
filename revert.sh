@@ -237,7 +237,9 @@ revert_action() {
       groupdel "$a1" >/dev/null 2>&1 && echo "  ${C_GRN}deleted${C_RST} group $a1"
       ;;
     CHAGE)
-      IFS=':' read -r mx mn wn <<<"$a2"
+      local mx mn wn
+      local IFS=':'
+      read -r mx mn wn <<<"$a2"
       local args=()
       [[ "$mx" =~ ^-?[0-9]+$ ]] && args+=(-M "$mx")
       [[ "$mn" =~ ^-?[0-9]+$ ]] && args+=(-m "$mn")
@@ -317,7 +319,10 @@ read -r -p "Proceed? [y/N]: " go
 
 REV_ACTIONS=()
 SSH_REVERTED=0
-for idx in "${TODO[@]}"; do
+declare -A TODO_SELECTED=()
+for idx in "${TODO[@]}"; do TODO_SELECTED["$idx"]=1; done
+for (( idx=${#TASK_ID[@]}-1; idx>=0; idx-- )); do
+  [[ -n "${TODO_SELECTED[$idx]:-}" ]] || continue
   tid="${TASK_ID[$idx]}"
   [[ "$tid" == "ssh" ]] && SSH_REVERTED=1
   echo
