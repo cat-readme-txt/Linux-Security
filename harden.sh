@@ -129,6 +129,7 @@ BACKUP_DIR="$RUN_DIR/backups"
 ACTIONS_LOG="$RUN_DIR/actions.log"      # machine-readable; consumed by revert.sh
 OUTPUT_LOG="$RUN_DIR/output.log"        # full human transcript
 CREDS_FILE="$RUN_DIR/new-credentials.txt"   # plaintext old/new passwords (root only)
+EASY_CREDS_FILE="$SCRIPT_DIR/harden-generated-credentials.txt" # easy-to-find copy (root only)
 mkdir -p "$BACKUP_DIR"
 : > "$ACTIONS_LOG"
 : > "$OUTPUT_LOG"
@@ -158,6 +159,25 @@ run() {
 
 # Queue a session-disrupting command to run at the very end of the whole run.
 defer() { DEFERRED_DESC+=("$1"); DEFERRED_CMD+=("$2"); }
+
+run_deferred_command() {
+  local cmd="$1" svc
+  case "$cmd" in
+    "systemctl restart "*)
+      svc="${cmd#systemctl restart }"
+      if [[ "$svc" =~ ^[A-Za-z0-9_.@:-]+$ ]]; then
+        run systemctl restart "$svc"
+      else
+        warn "Refusing unsupported deferred service name: $svc"
+        return 1
+      fi
+      ;;
+    *)
+      warn "Unsupported deferred command skipped: $cmd"
+      return 1
+      ;;
+  esac
+}
 
 # Record a machine-readable, revertible action line.  Fields are pipe-delimited.
 #   ACTION|<task>|<TYPE>|<arg1>|<arg2>...
@@ -234,12 +254,26 @@ record_service() {
 }
 
 # Idempotently set "key<sep>value" in a config file (updates or appends).
+escape_ere_literal() {
+  printf '%s' "$1" | sed 's/[][(){}.^$*+?|\\/]/\\&/g'
+}
+
+escape_sed_replacement() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//&/\\&}"
+  s="${s//#/\\#}"
+  printf '%s' "$s"
+}
+
 set_conf_kv() {
   local file="$1" key="$2" val="$3" sep="${4:- }"
+  local key_re repl
+  key_re="$(escape_ere_literal "$key")"
+  repl="$(escape_sed_replacement "${key}${sep}${val}")"
   prepare_edit "$file"
-  if grep -qE "^[[:space:]]*${key}([[:space:]]|=|$)" "$file" 2>/dev/null; then
-    # NOTE: use '#' as the sed delimiter; '|' would collide with the alternation.
-    sed -i -E "s#^[[:space:]]*${key}([[:space:]]|=).*#${key}${sep}${val}#" "$file"
+  if grep -qE "^[[:space:]]*${key_re}([[:space:]]|=|$)" "$file" 2>/dev/null; then
+    sed -i -E "s#^[[:space:]]*${key_re}([[:space:]]|=).*#${repl}#" "$file"
   else
     printf '%s%s%s\n' "$key" "$sep" "$val" >> "$file"
   fi
@@ -934,7 +968,7 @@ sec_web_sweep() {
 # ============================================================================
 sec_forensics() {
   start_task "forensics" "Forensic / Persistence Checks (read-only)"
-  local wl u out mp authlog count
+  local wl u out mp authlog count twf svc
   local -a scan_roots=() recent_roots=()
   log "Listening sockets:";                 run ss -tulpen
   log "All active TCP/UDP connections:";    run ss -tunap
@@ -968,6 +1002,12 @@ sec_forensics() {
   while IFS= read -r mp; do
     find "$mp" -xdev -type d -perm -0002 ! -perm -1000 -ls 2>/dev/null
   done < <(df --local -P 2>/dev/null | awk 'NR>1 {print $6}') | head -200
+  log "Filesystem layout for /, /home, /tmp, /var, /var/log, /dev/shm:"
+  if command -v findmnt >/dev/null 2>&1; then
+    run findmnt -no TARGET,SOURCE,FSTYPE,OPTIONS / /home /tmp /var /var/log /dev/shm 2>/dev/null || true
+  else
+    run df -h / /home /tmp /var /var/log /dev/shm 2>/dev/null || true
+  fi
   log "Files/directories with no owning user or group on local filesystems (first 200):"
   while IFS= read -r mp; do
     find "$mp" -xdev \( -nouser -o -nogroup \) -ls 2>/dev/null
@@ -999,11 +1039,60 @@ sec_forensics() {
     log "Mount options for temp/shared-memory paths:"
     run findmnt -no TARGET,OPTIONS /tmp /var/tmp /dev/shm /run/shm 2>/dev/null || true
   fi
+  log "/etc/resolv.conf (resolver configuration):"
+  if [[ -r /etc/resolv.conf ]]; then
+    run sed -n '1,80p' /etc/resolv.conf
+  else
+    warn "/etc/resolv.conf is not readable."
+  fi
+  log "TCP Wrappers files (/etc/hosts.allow and /etc/hosts.deny):"
+  for twf in /etc/hosts.allow /etc/hosts.deny; do
+    if [[ -r "$twf" ]]; then
+      echo "== $twf =="
+      sed -n '1,120p' "$twf"
+    else
+      info "$twf is absent or not readable."
+    fi
+  done
+  log "Passwordless sudo grants (NOPASSWD / !authenticate):"
+  grep -RInE 'NOPASSWD|!authenticate' /etc/sudoers /etc/sudoers.d 2>/dev/null || true
   for authlog in /var/log/auth.log /var/log/secure; do
     [[ -f "$authlog" ]] || continue
     count=$(grep -Eci 'Failed password|authentication failure|Invalid user' "$authlog" 2>/dev/null || true)
     info "$authlog failed-login style events: ${count:-0}"
   done
+  log "Account database validation:"
+  if command -v pwck >/dev/null 2>&1; then
+    run pwck -r || warn "pwck reported account database issues."
+  else
+    warn "pwck not available."
+  fi
+  if command -v grpck >/dev/null 2>&1; then
+    run grpck -r || warn "grpck reported group database issues."
+  else
+    warn "grpck not available."
+  fi
+  log "UID 0 accounts:"
+  awk -F: '$3==0{print "      " $0}' /etc/passwd 2>/dev/null || true
+  log "System/service accounts with interactive shells:"
+  awk -F: '($3 < 1000 && $1 != "root" && $7 !~ /(nologin|false)$/){print "      " $1 ":" $3 ":" $7}' /etc/passwd 2>/dev/null || true
+  log "Potential shell/environment injection lines:"
+  grep -RInE 'LD_PRELOAD|LD_LIBRARY_PATH|(^|[[:space:]])PATH=|alias[[:space:]]+|curl[[:space:]].*\||wget[[:space:]].*\||nc[[:space:]]|ncat[[:space:]]|/dev/tcp' \
+    /etc/environment /etc/profile /etc/bash.bashrc /etc/profile.d 2>/dev/null | head -200 || true
+  log "FTP account and /var/ftp permissions:"
+  if getent passwd ftp >/dev/null 2>&1; then
+    run getent passwd ftp || true
+  else
+    info "No ftp account found."
+  fi
+  [[ -d /var/ftp ]] && run ls -ld /var/ftp || true
+  log "Mail daemon/open-relay quick check:"
+  for svc in postfix sendmail exim4; do
+    command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q "^${svc}\.service" && run systemctl is-active "$svc" || true
+  done
+  [[ -f /etc/postfix/main.cf ]] && grep -nE '^(mynetworks|inet_interfaces|smtpd_recipient_restrictions)[[:space:]]*=' /etc/postfix/main.cf || true
+  log "NTP/chrony restriction quick check:"
+  grep -RInE '^[[:space:]]*(restrict|allow|cmdallow|port|acquisitionport)[[:space:]]' /etc/ntp.conf /etc/chrony.conf /etc/chrony/chrony.conf 2>/dev/null || true
   log "SSH .ssh directories (persistence check):"
   find /root /home -name ".ssh" -type d -exec ls -ld {} \; >> "$OUTPUT_LOG" 2>&1
   log "SSH authorized_keys across users:";    find /root /home -name authorized_keys -exec ls -l {} \; -exec cat {} \; >> "$OUTPUT_LOG" 2>&1
@@ -1016,6 +1105,10 @@ sec_forensics() {
   done
   log "SUID binaries:";                       find / -perm -4000 -type f 2>/dev/null
   log "SGID binaries:";                       find / -perm -2000 -type f 2>/dev/null >> "$OUTPUT_LOG" 2>&1
+  log "Non-standard SUID/SGID binaries on root filesystem (first 100):"
+  find / -xdev \( -perm -4000 -o -perm -2000 \) -type f -ls 2>/dev/null \
+    | grep -vE '/(bin|sbin|usr/(bin|sbin|lib(exec)?)|lib(64)?|snap)/' \
+    | head -100 || true
   if is_rhel; then
     log "SELinux status:"
     if command -v sestatus >/dev/null 2>&1; then run sestatus; else warn "sestatus not available."; fi
@@ -1160,6 +1253,18 @@ ensure_creds_file() {
     chmod 600 "$CREDS_FILE"
     echo "# Generated by harden.sh on $(date)  -- KEEP SECRET" >> "$CREDS_FILE"
   fi
+  if [[ ! -s "$EASY_CREDS_FILE" ]]; then
+    : > "$EASY_CREDS_FILE"
+    chmod 600 "$EASY_CREDS_FILE"
+    echo "# Generated by harden.sh on $(date)  -- KEEP SECRET" >> "$EASY_CREDS_FILE"
+  fi
+}
+
+save_credential_line() {
+  local line="$1"
+  ensure_creds_file
+  printf '%s\n' "$line" >> "$CREDS_FILE"
+  printf '%s\n' "$line" >> "$EASY_CREDS_FILE"
 }
 
 ensure_authorized_group_memberships() {
@@ -1261,7 +1366,10 @@ create_missing_authorized_users() {
       warn "Skipping invalid username '$u'."
       continue
     fi
-    newpw="$(gen_password)"
+    if ! newpw="$(gen_password)"; then
+      warn "Failed generating password for authorized user $u; user was not created."
+      continue
+    fi
     if run useradd -m -s "$shell" "$u"; then
       record_action "USER_CREATE" "$u"
     else
@@ -1269,8 +1377,8 @@ create_missing_authorized_users() {
       continue
     fi
     if printf '%s:%s\n' "$u" "$newpw" | chpasswd; then
-      printf '%-20s CREATED NEW=%s\n' "$u" "$newpw" >> "$CREDS_FILE"
-      ok "Created authorized user $u (password saved to $CREDS_FILE)"
+      save_credential_line "$(printf '%-20s CREATED NEW=%s' "$u" "$newpw")"
+      ok "Created authorized user $u (password: $newpw; saved to $CREDS_FILE and $EASY_CREDS_FILE)"
     else
       warn "Created $u but failed to set the generated password; locking account until manually fixed."
       run passwd -l "$u" >/dev/null 2>&1 || true
@@ -1729,18 +1837,27 @@ sec_passwords() {
 # four character classes (the rest random). LC_ALL=C is required so that tr
 # tolerates the binary bytes from /dev/urandom on any locale.
 gen_password() {
-  local lower upper digit special rest
-  lower=$(LC_ALL=C tr -dc '[:lower:]'  </dev/urandom | head -c1)
-  upper=$(LC_ALL=C tr -dc '[:upper:]'  </dev/urandom | head -c1)
-  digit=$(LC_ALL=C tr -dc '0-9'        </dev/urandom | head -c1)
-  special=$(LC_ALL=C tr -dc '!@#%^*_=+-' </dev/urandom | head -c1)
-  rest=$(LC_ALL=C tr -dc 'A-Za-z0-9!@#%^*_=+-' </dev/urandom | head -c16)
-  printf '%s' "${lower}${upper}${digit}${special}${rest}"
+  local lower upper digit special rest pw _attempt
+  for _attempt in {1..10}; do
+    lower=$(LC_ALL=C tr -dc '[:lower:]'  </dev/urandom | head -c1)
+    upper=$(LC_ALL=C tr -dc '[:upper:]'  </dev/urandom | head -c1)
+    digit=$(LC_ALL=C tr -dc '0-9'        </dev/urandom | head -c1)
+    special=$(LC_ALL=C tr -dc '!@#%^*_=+-' </dev/urandom | head -c1)
+    rest=$(LC_ALL=C tr -dc 'A-Za-z0-9!@#%^*_=+-' </dev/urandom | head -c16)
+    pw="${lower}${upper}${digit}${special}${rest}"
+    if [[ ${#pw} -eq 20 ]]; then
+      printf '%s' "$pw"
+      return 0
+    fi
+  done
+  printf 'ERROR: gen_password failed to produce a 20-character password after retries\n' >&2
+  return 1
 }
 
 # Built-in fallback: try common passwords + username variants against a hash
-# using python3's crypt (handles yescrypt/sha512/md5). Echoes the matched
-# plaintext if weak, nothing if not cracked.
+# using python3's crypt (handles yescrypt/sha512/md5). This must only be called
+# after python_crypt_available passes; Python 3.13+ removed crypt.
+# Echoes the matched plaintext if weak, nothing if not cracked.
 crack_one_builtin() {
   local user="$1" hash="$2" wordlist="$3"
   python3 - "$user" "$hash" "$wordlist" <<'PY'
@@ -1895,8 +2012,12 @@ sec_pwaudit() {
   if [[ -n "$john_bin" ]]; then
     log "Auditing hashes with John the Ripper (this can take a while)..."
     local combo="$tmpd/combined.txt"
-    if command -v unshadow >/dev/null 2>&1; then unshadow /etc/passwd /etc/shadow > "$combo" 2>/dev/null
-    else cp /etc/shadow "$combo"; fi
+    if command -v unshadow >/dev/null 2>&1; then
+      (umask 077; unshadow /etc/passwd /etc/shadow > "$combo" 2>/dev/null)
+    else
+      (umask 077; cp /etc/shadow "$combo")
+    fi
+    chmod 600 "$combo" 2>/dev/null || true
     [[ -s "$wordlist" ]] && run "$john_bin" --wordlist="$wordlist" "$combo"
     run "$john_bin" --single "$combo"           # username-based rules
     # collect cracked user:password pairs
@@ -1929,11 +2050,14 @@ sec_pwaudit() {
       ensure_creds_file
       for u in "${!WEAK[@]}"; do
         local oldpw="${WEAK[$u]}" oldhash="${USERHASH[$u]}" newpw
-        newpw="$(gen_password)"
+        if ! newpw="$(gen_password)"; then
+          err "Failed generating replacement password for $u; leaving password unchanged."
+          continue
+        fi
         # record original hash for precise, granular revert
         record_action "USER_PWHASH" "$u" "$oldhash"
         if printf '%s:%s\n' "$u" "$newpw" | chpasswd; then
-          printf '%-20s OLD(weak)=%-20s NEW=%s\n' "$u" "$oldpw" "$newpw" >> "$CREDS_FILE"
+          save_credential_line "$(printf '%-20s OLD(weak)=%-20s NEW=%s' "$u" "$oldpw" "$newpw")"
           echo "    ${C_GRN}RESET${C_RST} ${C_BLD}$u${C_RST}: old weak password '${oldpw}' -> new strong password: ${C_BLD}${newpw}${C_RST}"
         else
           err "Failed to reset password for $u"
@@ -2141,8 +2265,13 @@ restart_sshd_safe() {
   else
     err "sshd -t reported a configuration error! Restoring backup and NOT restarting."
     # restore from this run's backup
-    local bak="$BACKUP_DIR/files$SSHD_CONFIG"
-    [[ -f "$bak" ]] && cp -a "$bak" "$SSHD_CONFIG"
+    local bak="${BACKED_UP[$SSHD_CONFIG]:-$BACKUP_DIR/files/${CURRENT_TASK:-ssh}$SSHD_CONFIG}"
+    if [[ -f "$bak" ]]; then
+      cp -a "$bak" "$SSHD_CONFIG"
+      warn "Restored $SSHD_CONFIG from $bak"
+    else
+      warn "No SSH task backup found at $bak; inspect $SSHD_CONFIG manually before restarting sshd."
+    fi
     return 1
   fi
 }
@@ -2378,6 +2507,87 @@ sec_ssh() {
   set_ssh LogLevel VERBOSE
   ok "Baseline directives set"
 
+  if confirm "Set local and SSH warning banners? Outcome: displays 'authorized use only' notice before local/SSH login. Risk: replaces existing /etc/issue and /etc/issue.net banners"; then
+    local banner_text="Authorized use only. Activity may be monitored and reported."
+    prepare_edit /etc/issue
+    printf '%s\n' "$banner_text" > /etc/issue
+    prepare_edit /etc/issue.net
+    printf '%s\n' "$banner_text" > /etc/issue.net
+    set_ssh Banner /etc/issue.net
+    ok "Login banners configured in /etc/issue, /etc/issue.net, and sshd_config."
+  fi
+
+  if ask_risky "Restrict SSH Kex/Ciphers/MACs to modern algorithms. Outcome: disables weak SSH crypto. Risk: legacy SSH clients may fail to connect"; then
+    set_ssh KexAlgorithms "curve25519-sha256,diffie-hellman-group14-sha256,diffie-hellman-group16-sha512"
+    set_ssh Ciphers "aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr"
+    set_ssh MACs "hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com"
+    ok "Modern SSH Kex/Ciphers/MACs configured; sshd -t will validate before restart."
+  fi
+
+  log "SSH host key audit:"
+  local -a weak_hostkeys=()
+  if compgen -G "/etc/ssh/ssh_host_*_key.pub" >/dev/null; then
+    local hk hk_info hk_bits
+    for hk in /etc/ssh/ssh_host_*_key.pub; do
+      run ssh-keygen -l -f "$hk" || true
+      hk_info="$(ssh-keygen -l -f "$hk" 2>/dev/null || true)"
+      hk_bits="${hk_info%% *}"
+      case "$hk" in
+        *_dsa_key.pub)
+          weak_hostkeys+=("$hk")
+          ;;
+        *_rsa_key.pub)
+          if [[ "$hk_bits" =~ ^[0-9]+$ && "$hk_bits" -lt 2048 ]]; then
+            weak_hostkeys+=("$hk")
+          fi
+          ;;
+      esac
+    done
+  else
+    warn "No SSH host public keys found under /etc/ssh."
+  fi
+  if [[ ${#weak_hostkeys[@]} -gt 0 ]]; then
+    warn "Weak SSH host public keys detected: ${weak_hostkeys[*]}"
+    if ask_risky "Remove DSA or RSA<2048 SSH host keys and ensure an Ed25519 host key exists. Outcome: removes weak server identity keys. Risk: clients may need known_hosts updates if host keys change"; then
+      local pub base ed_key=/etc/ssh/ssh_host_ed25519_key ed_pub=/etc/ssh/ssh_host_ed25519_key.pub
+      for pub in "${weak_hostkeys[@]}"; do
+        base="${pub%.pub}"
+        [[ -e "$base" ]] && prepare_edit "$base"
+        [[ -e "$pub" ]] && prepare_edit "$pub"
+        run rm -f "$base" "$pub"
+        ok "Removed weak SSH host key pair for $base"
+      done
+      if [[ ! -f "$ed_pub" ]]; then
+        if [[ -f "$ed_key" ]]; then
+          prepare_edit "$ed_pub"
+          echo "    + ssh-keygen -y -f $ed_key > $ed_pub"
+          if ssh-keygen -y -f "$ed_key" > "$ed_pub"; then
+            run chmod 644 "$ed_pub"
+            ok "Regenerated missing Ed25519 SSH host public key."
+          else
+            run rm -f "$ed_pub"
+            warn "Could not regenerate $ed_pub from $ed_key; inspect SSH host keys before restarting sshd."
+          fi
+        else
+          prepare_edit "$ed_key"
+          prepare_edit "$ed_pub"
+          if run ssh-keygen -q -t ed25519 -N "" -f "$ed_key"; then
+            run chmod 600 "$ed_key"
+            run chmod 644 "$ed_pub"
+            ok "Generated Ed25519 SSH host key pair."
+          else
+            run rm -f "$ed_key" "$ed_pub"
+            warn "Failed to generate Ed25519 SSH host key pair; inspect /etc/ssh before restarting sshd."
+          fi
+        fi
+      fi
+    else
+      info "Weak SSH host key cleanup skipped by user."
+    fi
+  else
+    ok "No DSA or RSA<2048 SSH host public keys detected."
+  fi
+
   # NOTE: 'Protocol 2' is intentionally NOT written — it is removed/deprecated
   # on OpenSSH >= 7.6 and would make 'sshd -t' fail. Protocol 1 no longer exists.
 
@@ -2467,6 +2677,14 @@ sec_firewall() {
     prepare_edit /etc/ufw/user.rules
     prepare_edit /etc/ufw/user6.rules
     prepare_edit /etc/default/ufw
+    if [[ -f /etc/default/ufw ]] && grep -qiE '^[[:space:]]*IPV6[[:space:]]*=[[:space:]]*no' /etc/default/ufw; then
+      warn "UFW IPv6 support is disabled in /etc/default/ufw; IPv6 traffic may bypass expected UFW policy if IPv6 is enabled."
+      if confirm "Set UFW IPV6=yes before enabling/reloading? Outcome: UFW manages IPv6 rules too. Risk: existing IPv6 service exposure may change"; then
+        set_conf_kv /etc/default/ufw IPV6 yes "="
+      fi
+    else
+      ok "UFW IPv6 support is not explicitly disabled."
+    fi
     local was_active; was_active=$(ufw status 2>/dev/null | head -1)
     record_action "UFW_STATE" "$was_active"
 
@@ -2528,11 +2746,134 @@ sec_firewall() {
 # ============================================================================
 # SECTION 14 — Kernel / sysctl hardening
 # ============================================================================
+sysctl_proc_path() {
+  local key="$1"
+  printf '/proc/sys/%s\n' "${key//./\/}"
+}
+
+append_sysctl_if_supported() {
+  local file="$1" key="$2" val="$3" path
+  path="$(sysctl_proc_path "$key")"
+  if [[ -e "$path" ]]; then
+    printf '%s = %s\n' "$key" "$val" >> "$file"
+    return 0
+  fi
+  info "Skipping unsupported sysctl $key (no $path)"
+  return 1
+}
+
+grub_password_tool() {
+  if command -v grub-mkpasswd-pbkdf2 >/dev/null 2>&1; then
+    command -v grub-mkpasswd-pbkdf2
+  elif command -v grub2-mkpasswd-pbkdf2 >/dev/null 2>&1; then
+    command -v grub2-mkpasswd-pbkdf2
+  fi
+}
+
+grub_mkconfig_cmd() {
+  if command -v update-grub >/dev/null 2>&1; then
+    printf 'update-grub\n'
+  elif command -v grub2-mkconfig >/dev/null 2>&1; then
+    printf 'grub2-mkconfig\n'
+  elif command -v grub-mkconfig >/dev/null 2>&1; then
+    printf 'grub-mkconfig\n'
+  fi
+}
+
+grub_cfg_output_path() {
+  local p
+  for p in /boot/grub2/grub.cfg /boot/grub/grub.cfg; do
+    [[ -e "$p" ]] && { printf '%s\n' "$p"; return 0; }
+  done
+  if is_rhel || is_suse; then
+    printf '/boot/grub2/grub.cfg'
+  else
+    printf '/boot/grub/grub.cfg'
+  fi
+}
+
+configure_grub_password() {
+  if ! ask_risky "Set a GRUB bootloader superuser password. Outcome: blocks unauthenticated GRUB edit/rescue shell access. Risk: losing the password can block emergency boot edits; generated password will be displayed and saved"; then
+    return 0
+  fi
+  local tool mkconfig out cfg user pw hash tmp
+  tool="$(grub_password_tool || true)"
+  mkconfig="$(grub_mkconfig_cmd || true)"
+  if [[ -z "$tool" ]]; then
+    warn "No grub-mkpasswd-pbkdf2/grub2-mkpasswd-pbkdf2 found; GRUB password skipped."
+    return 1
+  fi
+  if [[ -z "$mkconfig" ]]; then
+    warn "No update-grub/grub*-mkconfig command found; GRUB password skipped."
+    return 1
+  fi
+  if ! pw="$(gen_password)"; then
+    warn "Could not generate GRUB password; skipped."
+    return 1
+  fi
+  hash="$(printf '%s\n%s\n' "$pw" "$pw" | "$tool" 2>/dev/null | awk '/grub\.pbkdf2/ {print $NF; exit}')"
+  if [[ -z "$hash" ]]; then
+    warn "GRUB password hash generation failed; skipped."
+    return 1
+  fi
+  user="hardenadmin"
+  cfg=/etc/grub.d/40_custom
+  prepare_edit "$cfg"
+  tmp="$(mktemp)" || return 1
+  sed '/^# BEGIN harden.sh GRUB password$/,/^# END harden.sh GRUB password$/d' "$cfg" > "$tmp" 2>/dev/null || : > "$tmp"
+  cat >> "$tmp" <<EOF
+# BEGIN harden.sh GRUB password
+set superusers="${user}"
+password_pbkdf2 ${user} ${hash}
+# END harden.sh GRUB password
+EOF
+  cat "$tmp" > "$cfg"
+  rm -f "$tmp"
+  run chmod 755 "$cfg"
+  save_credential_line "$(printf '%-20s USER=%s NEW=%s HASH=%s' "GRUB_BOOTLOADER" "$user" "$pw" "$hash")"
+  ok "GRUB bootloader password set for user '$user'. Password: $pw"
+  ok "GRUB password saved to $CREDS_FILE and $EASY_CREDS_FILE"
+  if [[ "$mkconfig" == "update-grub" ]]; then
+    run update-grub
+  else
+    out="$(grub_cfg_output_path)"
+    run "$mkconfig" -o "$out"
+  fi
+}
+
+configure_module_blacklist() {
+  if ! ask_risky "Blacklist uncommon filesystems and USB mass storage. Outcome: reduces kernel attack surface. Risk: USB drives or uncommon filesystem mounts may stop working after reboot"; then
+    return 0
+  fi
+  local f=/etc/modprobe.d/99-hardening-blacklist.conf
+  prepare_edit "$f"
+  cat > "$f" <<'EOF'
+# Managed by harden.sh
+install cramfs /bin/true
+install freevxfs /bin/true
+install jffs2 /bin/true
+install hfs /bin/true
+install hfsplus /bin/true
+install squashfs /bin/true
+install udf /bin/true
+install usb-storage /bin/true
+EOF
+  ok "Kernel module blacklist written to $f (takes effect for future module loads/reboot)."
+}
+
 sec_kernel() {
   start_task "kernel" "Kernel / sysctl Hardening"
   require_supported_write "Kernel / sysctl Hardening" || { end_task; return; }
   local f="/etc/sysctl.d/99-hardening.conf"
   prepare_edit "$f"
+  log "Boot/Secure Boot status (read-only)"
+  if command -v mokutil >/dev/null 2>&1; then
+    run mokutil --sb-state || true
+  elif command -v bootctl >/dev/null 2>&1; then
+    run bootctl status || true
+  else
+    warn "mokutil/bootctl not found; Secure Boot status check skipped."
+  fi
   log "Writing $f"
   cat > "$f" <<'EOF'
 # Managed by harden.sh
@@ -2579,6 +2920,11 @@ net.ipv6.conf.default.autoconf = 0
 net.ipv6.conf.default.dad_transmits = 0
 net.ipv6.conf.default.max_addresses = 1
 EOF
+  append_sysctl_if_supported "$f" kernel.unprivileged_userns_clone 0 || true
+  append_sysctl_if_supported "$f" kernel.unprivileged_bpf_disabled 1 || true
+  append_sysctl_if_supported "$f" net.core.bpf_jit_harden 2 || true
+  append_sysctl_if_supported "$f" net.ipv6.conf.all.use_tempaddr 2 || true
+  append_sysctl_if_supported "$f" net.ipv6.conf.default.use_tempaddr 2 || true
   ok "Baseline sysctl settings written"
 
   # RISKY (checklist value, but a downgrade on a busy web VM): fs.file-max=65535
@@ -2622,8 +2968,41 @@ EOF
     ok "nospoof on written to /etc/host.conf"
   fi
 
-  run sysctl --system
-  ok "sysctl settings applied"
+  if confirm "Disable core dumps through limits/profile settings? Outcome: reduces leakage of passwords/keys in crash dumps. Risk: makes debugging crashes harder"; then
+    local limits_file=/etc/security/limits.d/99-hardening-coredumps.conf profile_file=/etc/profile.d/99-disable-coredumps.sh
+    prepare_edit "$limits_file"
+    printf '* hard core 0\n* soft core 0\n' > "$limits_file"
+    run chmod 644 "$limits_file"
+    prepare_edit "$profile_file"
+    printf 'ulimit -c 0\n' > "$profile_file"
+    run chmod 644 "$profile_file"
+    ok "Core dump limits configured."
+  fi
+
+  configure_module_blacklist
+  configure_grub_password
+
+  if is_rhel && command -v update-crypto-policies >/dev/null 2>&1 && \
+     ask_risky "Set system crypto policy to DEFAULT:NO-SHA1. Outcome: blocks SHA-1 in supported TLS/crypto stacks. Risk: legacy clients/services may fail TLS or package validation"; then
+    run update-crypto-policies --show || true
+    record_action "NOTE" "crypto_policy_set_DEFAULT_NO_SHA1_not_revertible"
+    run update-crypto-policies --set DEFAULT:NO-SHA1
+    ok "System crypto policy set to DEFAULT:NO-SHA1."
+  fi
+
+  local sysctl_log="$BACKUP_DIR/sysctl-apply.log"
+  echo "    + sysctl --system"
+  if sysctl --system >"$sysctl_log" 2>&1; then
+    ok "sysctl --system completed"
+  else
+    warn "sysctl --system returned nonzero; review $sysctl_log"
+  fi
+  cat "$sysctl_log"
+  if grep -Eiq 'error|invalid|cannot stat|No such file|permission denied|unknown key' "$sysctl_log" 2>/dev/null; then
+    warn "sysctl apply warnings/errors detected; review $sysctl_log and remove unsupported keys before rerunning."
+  else
+    ok "sysctl settings applied without obvious errors"
+  fi
   end_task
 }
 
@@ -3018,6 +3397,86 @@ secure_dns_config() {
   fi
 }
 
+set_ntp_restrict_default() {
+  local f="$1" line="restrict default kod nomodify nopeer noquery limited"
+  if grep -qE '^[[:space:]]*restrict[[:space:]]+default([[:space:]]|$)' "$f" 2>/dev/null; then
+    sed -i -E "s#^[[:space:]]*restrict[[:space:]]+default.*#${line}#" "$f"
+  else
+    printf '%s\n' "$line" >> "$f"
+  fi
+}
+
+secure_time_sync_config() {
+  local f changed_ntp=0 changed_chrony=0
+  local -a ntp_files=() chrony_files=()
+  [[ -f /etc/ntp.conf ]] && ntp_files+=("/etc/ntp.conf")
+  for f in /etc/chrony.conf /etc/chrony/chrony.conf; do
+    [[ -f "$f" ]] && chrony_files+=("$f")
+  done
+
+  if [[ ${#ntp_files[@]} -eq 0 && ${#chrony_files[@]} -eq 0 ]]; then
+    ok "No ntpd/chrony config files found; time sync hardening skipped."
+    return 0
+  fi
+
+  if [[ ${#ntp_files[@]} -gt 0 ]] && \
+     ask_risky "Apply client-safe ntpd restrictions. Outcome: blocks NTP control/peer queries by default. Risk: breaks this VM if it must serve NTP clients/peers"; then
+    for f in "${ntp_files[@]}"; do
+      prepare_edit "$f"
+      set_ntp_restrict_default "$f"
+      ok "Updated ntpd default restrictions in $f"
+    done
+    changed_ntp=1
+  elif [[ ${#ntp_files[@]} -gt 0 ]]; then
+    info "ntpd restriction hardening skipped."
+  fi
+
+  if [[ ${#chrony_files[@]} -gt 0 ]] && \
+     ask_risky "Disable chrony NTP serving and network command ports (port 0, cmdport 0). Outcome: client-only time sync. Risk: breaks this VM if it must serve NTP clients"; then
+    for f in "${chrony_files[@]}"; do
+      prepare_edit "$f"
+      set_conf_kv "$f" port 0 " "
+      set_conf_kv "$f" cmdport 0 " "
+      ok "Updated chrony client-only settings in $f"
+    done
+    changed_chrony=1
+  elif [[ ${#chrony_files[@]} -gt 0 ]]; then
+    info "chrony client-only hardening skipped."
+  fi
+
+  if [[ $changed_ntp -eq 1 ]]; then
+    restart_service_if_present ntp
+    restart_service_if_present ntpd
+  fi
+  if [[ $changed_chrony -eq 1 ]]; then
+    restart_service_if_present chrony
+    restart_service_if_present chronyd
+  fi
+}
+
+secure_tcp_wrappers_config() {
+  if ! ask_risky "Configure legacy TCP Wrappers deny-all default. Outcome: libwrap-linked services are denied unless allowed in /etc/hosts.allow. Risk: can block older SSH/FTP/xinetd services; verify required allow rules first"; then
+    info "TCP Wrappers deny-all hardening skipped."
+    return 0
+  fi
+
+  local allow=/etc/hosts.allow deny=/etc/hosts.deny
+  warn "No hosts.allow entries are guessed here; add authorized source rules manually when a legacy libwrap-linked service must remain reachable."
+  prepare_edit "$allow"
+  if [[ ! -s "$allow" ]]; then
+    {
+      echo "# Managed by harden.sh"
+      echo "# Add explicit legacy TCP Wrappers allow rules above /etc/hosts.deny's ALL: ALL when required."
+    } > "$allow"
+  fi
+  prepare_edit "$deny"
+  if ! grep -qE '^[[:space:]]*ALL[[:space:]]*:[[:space:]]*ALL([[:space:]]|$)' "$deny" 2>/dev/null; then
+    printf 'ALL: ALL\n' >> "$deny"
+  fi
+  run chmod 644 "$allow" "$deny"
+  ok "Legacy TCP Wrappers deny-all default configured in $deny."
+}
+
 secure_apache_extra_config() {
   if ! pkg_installed apache2 && ! pkg_installed httpd && ! command -v apache2ctl >/dev/null 2>&1 && ! command -v httpd >/dev/null 2>&1; then
     ok "Apache/httpd not detected; extra Apache hardening skipped."
@@ -3129,7 +3588,7 @@ secure_php_advanced_config() {
     [[ -f "$f" ]] || continue
     log "Applying advanced PHP settings to $f"
     prepare_edit "$f"
-    [[ $disable_funcs -eq 1 ]] && set_conf_kv "$f" disable_functions "exec,passthru,shell_exec,system,proc_open,popen" " = "
+    [[ $disable_funcs -eq 1 ]] && set_conf_kv "$f" disable_functions "exec,passthru,shell_exec,system,proc_open,popen,assert,pcntl_exec,pcntl_fork,dl" " = "
     [[ $allow_include -eq 1 ]] && set_conf_kv "$f" allow_url_include Off " = "
     if [[ $session_base -eq 1 ]]; then
       set_conf_kv "$f" session.use_strict_mode 1 " = "
@@ -3333,7 +3792,7 @@ sec_services() {
 # SECTION 16 — Critical service config hardening
 # ============================================================================
 sec_service_configs() {
-  start_task "service_configs" "Service Config Hardening (FTP / Apache / ModSecurity / Nginx / PHP / DB)"
+  start_task "service_configs" "Service Config Hardening (FTP / Apache / ModSecurity / Nginx / PHP / DNS / Time)"
   require_supported_write "Service Config Hardening" || { end_task; return; }
   warn "Only harden service configs here if the service is authorized and should remain installed; every optional hardening item validates before restart when tooling exists."
   if confirm "Apply vsftpd FTP hardening if vsftpd is present?"; then
@@ -3381,9 +3840,79 @@ sec_service_configs() {
   else
     info "DNS config hardening skipped by user."
   fi
+  secure_time_sync_config
+  secure_tcp_wrappers_config
   # Always surface DB advice (read-only; never purges a scored database).
   secure_database_advice
   end_task
+}
+
+harden_runtime_temp_mount_options() {
+  if ! command -v findmnt >/dev/null 2>&1 || ! command -v mount >/dev/null 2>&1; then
+    warn "findmnt/mount not available; temp mount option hardening skipped."
+    return 0
+  fi
+  if ! ask_risky "Remount separate /tmp, /var/tmp, and /dev/shm with noexec,nosuid,nodev for this boot. Outcome: blocks execution/setuid/device files on temp mounts. Risk: apps that execute from temp paths can break; persistent fstab/systemd changes are not guessed"; then
+    return 0
+  fi
+
+  local target actual current opt opt_csv
+  local -a missing_opts=()
+  for target in /tmp /var/tmp /dev/shm; do
+    [[ -d "$target" ]] || { info "$target is absent; skipping."; continue; }
+    actual="$(findmnt -n -T "$target" -o TARGET 2>/dev/null | head -n 1 || true)"
+    if [[ -z "$actual" ]]; then
+      warn "Could not determine mountpoint for $target; skipping."
+      continue
+    fi
+    if [[ "$actual" != "$target" ]]; then
+      warn "$target is backed by parent mount $actual; skipping remount to avoid applying noexec/nosuid/nodev to a broader filesystem."
+      continue
+    fi
+    current="$(findmnt -n -T "$target" -o OPTIONS 2>/dev/null | head -n 1 || true)"
+    missing_opts=()
+    for opt in noexec nosuid nodev; do
+      [[ ",$current," == *",$opt,"* ]] || missing_opts+=("$opt")
+    done
+    if [[ ${#missing_opts[@]} -eq 0 ]]; then
+      ok "$target already has noexec,nosuid,nodev."
+      continue
+    fi
+    opt_csv="$(IFS=,; printf '%s' "${missing_opts[*]}")"
+    record_action "NOTE" "runtime_remount_${target}_${opt_csv}_not_revertible"
+    if run mount -o "remount,${opt_csv}" "$target"; then
+      ok "Runtime remount applied to $target: $opt_csv"
+    else
+      warn "Runtime remount failed for $target; review current mount options manually."
+    fi
+  done
+}
+
+repair_world_writable_sticky_bits() {
+  local d mp
+  local -a sticky_missing=()
+  while IFS= read -r d; do
+    sticky_missing+=("$d")
+  done < <(
+    while IFS= read -r mp; do
+      [[ -d "$mp" ]] || continue
+      find "$mp" -xdev -type d -perm -0002 ! -perm -1000 -print 2>/dev/null
+    done < <(df --local -P 2>/dev/null | awk 'NR>1 {print $6}') | sort -u | head -200
+  )
+
+  if [[ ${#sticky_missing[@]} -eq 0 ]]; then
+    ok "No world-writable directories missing sticky bit found on local filesystems."
+    return 0
+  fi
+  warn "Sticky bit repair outcome: prevents users from deleting/renaming each other's files in shared writable directories."
+  warn "Sticky bit repair risk: unusual collaboration directories may intentionally allow that behavior; verify selected paths."
+  prompt_selection "world-writable directories missing sticky bit to chmod +t" "${sticky_missing[@]}"
+  for d in "${SELECTED[@]}"; do
+    [[ -d "$d" ]] || { warn "$d disappeared; skipping."; continue; }
+    record_perm "$d"
+    run chmod +t "$d"
+    ok "Added sticky bit to $d"
+  done
 }
 
 # ============================================================================
@@ -3405,6 +3934,8 @@ sec_perms() {
     record_perm "$f"
     run chmod 1777 "$f"
   done
+  repair_world_writable_sticky_bits
+  harden_runtime_temp_mount_options
 
   # per-user .ssh
   while IFS= read -r d; do
@@ -3450,6 +3981,49 @@ sec_perms() {
   echo "umask 027" > "$uf"
   run chmod 644 "$uf"
   ok "umask 027 set for new shells ($uf)"
+
+  if confirm "Set shell idle timeout TMOUT=600? Outcome: logs out idle interactive shells after 10 minutes. Risk: long idle admin shells may be disconnected"; then
+    local tf=/etc/profile.d/99-session-timeout.sh
+    prepare_edit "$tf"
+    cat > "$tf" <<'EOF'
+# Managed by harden.sh
+readonly TMOUT=600
+export TMOUT
+EOF
+    run chmod 644 "$tf"
+    ok "TMOUT idle shell timeout configured in $tf"
+  fi
+
+  if confirm "Replace /etc/motd with a minimal warning? Outcome: removes possible OS/kernel information leakage after login. Risk: replaces existing custom MOTD content"; then
+    prepare_edit /etc/motd
+    printf 'Authorized use only. Activity may be monitored.\n' > /etc/motd
+    run chmod 644 /etc/motd
+    ok "/etc/motd replaced with minimal warning text."
+  fi
+
+  if [[ -d /boot ]] && confirm "Restrict /boot permissions to 750? Outcome: reduces local browsing of boot artifacts. Risk: unusual non-root backup/monitoring tools may need access adjusted"; then
+    record_perm /boot
+    run chown root:root /boot
+    run chmod 750 /boot
+    ok "/boot permissions set to root:root 750."
+  fi
+
+  if [[ -e /etc/securetty ]] && ask_risky "Restrict direct root console login by emptying /etc/securetty. Outcome: blocks root password login on listed TTYs where PAM honors securetty. Risk: can remove an emergency console login path; verify sudo/rescue access first"; then
+    prepare_edit /etc/securetty
+    : > /etc/securetty
+    run chmod 600 /etc/securetty
+    ok "/etc/securetty emptied."
+  fi
+
+  if confirm "Restrict common compilers/build tools to root/group execution? Outcome: limits local exploit compilation. Risk: legitimate developers or build jobs may fail"; then
+    local tool
+    for tool in /usr/bin/gcc /usr/bin/cc /usr/bin/g++ /usr/bin/c++ /usr/bin/make /usr/bin/as; do
+      [[ -e "$tool" ]] || continue
+      record_perm "$tool"
+      run chmod 750 "$tool"
+      ok "Restricted $tool to owner/group execution."
+    done
+  fi
   end_task
 }
 
@@ -3517,6 +4091,15 @@ EOF
 # ============================================================================
 # SECTION 19 — auditd
 # ============================================================================
+append_audit_watch_if_exists() {
+  local rules_file="$1" path="$2" perms="$3" key="$4"
+  if [[ -e "$path" ]]; then
+    printf -- '-w %s -p %s -k %s\n' "$path" "$perms" "$key" >> "$rules_file"
+  else
+    info "Audit watch skipped; path not present: $path"
+  fi
+}
+
 sec_auditd() {
   start_task "auditd" "Auditd / rsyslog / Process Accounting"
   require_supported_write "Auditd / rsyslog / Process Accounting" || { end_task; return; }
@@ -3536,26 +4119,82 @@ sec_auditd() {
   record_service auditd
   run systemctl enable --now auditd
 
-  local rf=/etc/audit/rules.d/99-hardening.rules
+  local rf=/etc/audit/rules.d/99-hardening.rules modbin
   prepare_edit "$rf"
-  cat > "$rf" <<'EOF'
--w /etc/passwd -p wa -k identity
--w /etc/shadow -p wa -k identity
--w /etc/gshadow -p wa -k identity
--w /etc/group -p wa -k identity
--w /etc/sudoers -p wa -k sudoers
--w /etc/sudoers.d/ -p wa -k sudoers
--w /etc/ssh/sshd_config -p wa -k sshd
--w /var/log/sudo.log -p wa -k sudoaction
-EOF
+  : > "$rf"
+  append_audit_watch_if_exists "$rf" /etc/passwd wa identity
+  append_audit_watch_if_exists "$rf" /etc/shadow wa identity
+  append_audit_watch_if_exists "$rf" /etc/gshadow wa identity
+  append_audit_watch_if_exists "$rf" /etc/group wa identity
+  append_audit_watch_if_exists "$rf" /etc/sudoers wa sudoers
+  append_audit_watch_if_exists "$rf" /etc/sudoers.d/ wa sudoers
+  append_audit_watch_if_exists "$rf" "$SSHD_CONFIG" wa sshd
+  append_audit_watch_if_exists "$rf" /var/log/sudo.log wa sudoaction
+  append_audit_watch_if_exists "$rf" /etc/crontab wa cron
+  append_audit_watch_if_exists "$rf" /etc/cron.d/ wa cron
+  append_audit_watch_if_exists "$rf" /var/spool/cron/ wa cron
+  append_audit_watch_if_exists "$rf" /var/spool/cron/crontabs/ wa cron
+  append_audit_watch_if_exists "$rf" /etc/hosts wa network
+  append_audit_watch_if_exists "$rf" /etc/pam.d/ wa pam
+  for modbin in /sbin/insmod /usr/sbin/insmod /sbin/modprobe /usr/sbin/modprobe /sbin/rmmod /usr/sbin/rmmod; do
+    append_audit_watch_if_exists "$rf" "$modbin" x modules
+  done
   # Watch the platform's authentication log (Debian: auth.log, RHEL: secure).
   [[ -e /var/log/auth.log ]] && echo '-w /var/log/auth.log -p wa -k authlog' >> "$rf"
   [[ -e /var/log/secure   ]] && echo '-w /var/log/secure -p wa -k authlog'   >> "$rf"
+  if ask_risky "Add auditd execve logging. Outcome: records executed commands for investigations. Risk: high log volume on busy web VMs"; then
+    if [[ "$(getconf LONG_BIT 2>/dev/null || echo 64)" == "64" ]]; then
+      echo '-a always,exit -F arch=b64 -S execve -k exec_log' >> "$rf"
+    fi
+    echo '-a always,exit -F arch=b32 -S execve -k exec_log' >> "$rf"
+  fi
 
-  run augenrules --load 2>/dev/null
-  run auditctl -e 1        # enable auditing (the checklist's 'auditctl -e 1')
-  run auditctl -l
+  if command -v augenrules >/dev/null 2>&1; then
+    run augenrules --load || warn "augenrules --load failed; audit rules may require manual review."
+  elif command -v auditctl >/dev/null 2>&1; then
+    warn "augenrules not found; loading audit rules with auditctl fallback."
+    run auditctl -R "$rf" || warn "auditctl fallback failed to load $rf."
+    run systemctl restart auditd 2>/dev/null || true
+  else
+    warn "Neither augenrules nor auditctl is available; audit rules were written but not loaded."
+  fi
+  if command -v auditctl >/dev/null 2>&1; then
+    run auditctl -e 1        # enable auditing (the checklist's 'auditctl -e 1')
+    run auditctl -l
+    if ask_risky "Set auditd immutable mode (-e 2). Outcome: audit rules cannot be changed until reboot. Risk: revert.sh cannot undo this during the same boot; reboot required"; then
+      record_action "NOTE" "auditd_immutable_enabled_reboot_required"
+      run auditctl -e 2
+      ok "auditd immutable mode requested; reboot is required to undo."
+    fi
+  else
+    warn "auditctl not found; cannot enable/list live audit rules."
+  fi
   ok "auditd enabled with identity/sudoers/sshd/authlog watch rules"
+
+  if confirm "Enable persistent journald storage? Outcome: keeps journal logs across reboot. Risk: uses disk space under /var/log/journal"; then
+    local jf=/etc/systemd/journald.conf
+    prepare_edit "$jf"
+    set_conf_kv "$jf" Storage persistent "="
+    run mkdir -p /var/log/journal
+    run systemctl restart systemd-journald
+    ok "journald persistent storage enabled."
+  fi
+
+  if [[ -e /var/log/sudo.log || -e /etc/sudoers.d/logging ]] && confirm "Install logrotate rule for /var/log/sudo.log? Outcome: prevents sudo log growth. Risk: rotates sudo command logs according to local logrotate schedule"; then
+    local lr=/etc/logrotate.d/harden-sudo
+    prepare_edit "$lr"
+    cat > "$lr" <<'EOF'
+/var/log/sudo.log {
+    weekly
+    rotate 12
+    compress
+    missingok
+    notifempty
+    create 0600 root root
+}
+EOF
+    ok "logrotate rule written to $lr"
+  fi
 
   if confirm "Ensure rsyslog is installed and enabled? Outcome: keeps traditional auth/system logs populated. Risk: installs/enables a logging daemon and may duplicate journald logs"; then
     if pkg_install_tracked rsyslog; then
@@ -3974,7 +4613,7 @@ run_deferred() {
   echo "${C_YEL}${C_BLD}=== Deferred actions (these may END your session) ===${C_RST}"
   echo "Everything else is complete. Full transcript saved to:"
   echo "  ${C_BLD}$OUTPUT_LOG${C_RST}"
-  echo "After you log back in, review it with:  ${C_BLD}sudo $0 --show-last${C_RST}"
+  echo "After you log back in, review it with:  ${C_BLD}sudo \"$SCRIPT_DIR/harden.sh\" --show-last${C_RST}"
   echo "Pending:"
   local i
   for i in "${!DEFERRED_CMD[@]}"; do echo "  - ${DEFERRED_DESC[$i]}"; done
@@ -3984,7 +4623,7 @@ run_deferred() {
   fi
   for i in "${!DEFERRED_CMD[@]}"; do
     log "Deferred: ${DEFERRED_DESC[$i]}"
-    eval "${DEFERRED_CMD[$i]}"
+    run_deferred_command "${DEFERRED_CMD[$i]}"
   done
 }
 
@@ -4033,7 +4672,7 @@ main() {
     echo
   fi
   log "${C_GRN}${C_BLD}All selected sections complete.${C_RST}"
-  log "Transcript: $OUTPUT_LOG   (replay later: sudo $0 --show-last)"
+  log "Transcript: $OUTPUT_LOG   (replay later: sudo \"$SCRIPT_DIR/harden.sh\" --show-last)"
   log "To undo changes: sudo ./revert.sh --log \"$ACTIONS_LOG\""
 
   # Disruptive actions (display-manager restart) happen here, dead last.

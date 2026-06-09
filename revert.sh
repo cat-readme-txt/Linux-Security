@@ -17,6 +17,9 @@
 #   * Package PURGES are reversed by REINSTALLING (config from the package
 #     defaults; user data in deleted home dirs is restored from the archive
 #     harden.sh made).
+#   * Reverting one task restores files to that task's pre-task snapshot. If
+#     multiple selected tasks touched the same file, revert all of those tasks
+#     to walk the file back through each saved state.
 #   * Some actions are intrinsically irreversible and will be reported but not
 #     undone (e.g. permanently deleted .mp3 files).
 # ============================================================================
@@ -249,9 +252,11 @@ revert_action() {
       groupdel "$a1" >/dev/null 2>&1 && echo "  ${C_GRN}deleted${C_RST} group $a1"
       ;;
     CHAGE)
-      local mx mn wn
-      local IFS=':'
+      local mx mn wn old_ifs
+      old_ifs="$IFS"
+      IFS=':'
       read -r mx mn wn <<<"$a2"
+      IFS="$old_ifs"
       local args=()
       [[ "$mx" =~ ^-?[0-9]+$ ]] && args+=(-M "$mx")
       [[ "$mn" =~ ^-?[0-9]+$ ]] && args+=(-m "$mn")

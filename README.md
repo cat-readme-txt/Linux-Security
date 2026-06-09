@@ -108,7 +108,7 @@ Each run writes to `/var/backups/security-hardening/run_<timestamp>/`:
 13. Firewall (UFW / firewalld)
 14. Kernel / sysctl Hardening
 15. Unwanted Services & Packages
-16. Service Config Hardening (FTP / Apache / ModSecurity / Nginx / PHP / DB)
+16. Service Config Hardening (FTP / Apache / ModSecurity / Nginx / PHP / DNS / Time)
 17. File Permissions & umask
 18. Display Manager (guest / autologin) — *restart deferred to end of run*
 19. Auditd / rsyslog / Process Accounting
@@ -132,8 +132,9 @@ candidates against it. This section:
 2. Falls back to a **built-in `crypt`-compare** (python3, supports yescrypt/sha512/md5)
    over a common-password + username-variation list when john/network is unavailable.
 3. For each account whose password is cracked (= weak), generates a 20-char strong
-   password, sets it, and writes `OLD(weak)` + `NEW` to a root-only `new-credentials.txt`
-   in the run dir (also echoed to the console). The original hash is recorded so it's
+   password, sets it, and writes `OLD(weak)` + `NEW` to the root-only run-dir
+   `new-credentials.txt` and to root-only `harden-generated-credentials.txt` next
+   to `harden.sh` (also echoed to the console). The original hash is recorded so it's
    fully revertible. Covers **all** accounts with a usable password, including root, but
    **skips the account(s) tied to the active sudo/login session** (`$SUDO_USER`, `logname`,
    `who am i`, `LOGNAME`, or `USER`). If the script is launched from a root shell where no
@@ -150,18 +151,26 @@ candidates against it. This section:
 - Web/app and DB backup snapshots (can be slow and stores secrets in the run dir)
 - SSH port 22 → 2222
 - SSH authentication mode changes: key-only, key+password, or password-only
+- SSH Kex/Ciphers/MACs restrictions (legacy SSH clients may fail)
+- SSH weak host-key cleanup for DSA or RSA<2048 keys (clients may need `known_hosts` updates)
 - `AllowGroups sshusers` (prompts before adding the current operator account)
 - Enabling the firewall (SSH is allowed first to avoid lockout)
 - Enabling `fail2ban` (can ban scoring/Orange Team source IPs if misconfigured)
 - `fail2ban` ignore-list entries (trusted IPs/CIDRs will never be banned)
 - Locking root
+- GRUB bootloader password (generated password is displayed and saved)
+- Emptying `/etc/securetty` to restrict direct root console login
 - Injecting `pam_pwquality` into PAM stacks
 - Enforcing SELinux/AppArmor profiles
+- Module blacklisting for USB storage/uncommon filesystems
+- RHEL/Fedora-family system crypto policy `DEFAULT:NO-SHA1`
 - `icmp_echo_ignore_all` (blocks ping; the checklist warns it can break scoring)
 - Disabling IPv6
 - Checklist TCP tuning / low `fs.file-max`
 - `/etc/host.conf` `nospoof on` compatibility item
 - BIND recursion ACLs / zone-transfer defaults (can break resolver clients or secondary DNS)
+- NTP/chrony client-only hardening (can break VMs that are intended to serve time)
+- Legacy TCP Wrappers deny-all default (can block older libwrap-linked services)
 - Apache/Nginx directory-listing and browser-header hardening (can break intentional indexes, embeds, or cross-origin flows)
 - PHP dangerous-function/session-cookie hardening (can break apps that call shell functions or use HTTP-only sessions)
 - AIDE baseline initialization (trusts the current filesystem state)
@@ -173,6 +182,11 @@ candidates against it. This section:
 - Resetting weak passwords (section 10 — confirmed before running)
 - Apache ModSecurity setup in DetectionOnly mode
 - Top-level home directory privacy and common log permission tightening
+- `/boot` permission tightening, TMOUT idle timeout, MOTD/banner replacement, compiler restrictions
+- Sticky-bit repair for discovered world-writable directories
+- Runtime-only `noexec,nosuid,nodev` remounts for separate `/tmp`, `/var/tmp`, and `/dev/shm` mounts
+- auditd execve logging and immutable mode (`-e 2`, reboot required to undo)
+- Persistent journald storage and sudo logrotate setup
 - Process accounting / rsyslog enablement (extra logging and service changes)
 - Permanently deleting media files
 
